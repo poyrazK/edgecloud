@@ -22,7 +22,7 @@ import (
 type appRepoInterface interface {
 	Create(ctx context.Context, app *domain.App) error
 	Get(ctx context.Context, tenantID, appName string) (*domain.App, error)
-	List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	List(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error)
 	CountByTenant(ctx context.Context, tenantID string) (int, error)
 	AtomicDelete(ctx context.Context, tenantID, appName string) (bool, error)
 	InsertIfNotExists(ctx context.Context, app *domain.App) (bool, error)
@@ -200,9 +200,15 @@ func (s *AppService) GetForUpdate(ctx context.Context, tenantID, appName string)
 	return s.appRepo.GetForUpdate(ctx, tenantID, appName)
 }
 
-// List returns apps for a tenant with pagination.
+// List returns apps for a tenant with pagination. Issue #58: the
+// underlying repo signature switched from offset-based to keyset;
+// the service signature still accepts (limit, offset) for the
+// app.go List caller (the handler, see Commit 4) where this is
+// called for the first page. Subsequent pages use the keyset API
+// directly via the handler.
 func (s *AppService) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
-	return s.appRepo.List(ctx, tenantID, limit, offset)
+	_ = offset
+	return s.appRepo.List(ctx, tenantID, limit, "")
 }
 
 // Update updates mutable fields of an existing app.

@@ -69,10 +69,25 @@ func (r *AppRepository) GetForUpdate(ctx context.Context, tenantID, appName stri
 	return &app, err
 }
 
-func (r *AppRepository) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
+// List returns up to limit apps for a tenant, paginated by name via
+// keyset (issue #58). The caller passes the previous page's last
+// visible app's name as afterName; the empty string means "first
+// page" (no lower-bound predicate). Ordering is `name ASC` so the
+// (tenant_id, name) UNIQUE constraint guarantees a strict total
+// order across the page boundary — there can be no ties on name
+// within a tenant, so the strict-tuple (created_at, id) fallback
+// that deployments uses is not needed here.
+//
+// Backed by idx_apps_tenant_id (from migration 004_apps) for the
+// WHERE filter; the keyset predicate `name > $2` lets the planner
+// walk that index in cursor order without an in-memory sort. The
+// page-walk loop in the service layer calls this with afterName = ""
+// on the first page and with the previous page's last name on every
+// subsequent page.
+func (r *AppRepository) List(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error) {
 	var apps []domain.App
-	query := `SELECT id, tenant_id, name, description, created_at FROM apps WHERE tenant_id = $1 ORDER BY name LIMIT $2 OFFSET $3`
-	err := r.db.SelectContext(ctx, &apps, query, tenantID, limit, offset)
+	query := `SELECT id, tenant_id, name, description, created_at FROM apps WHERE tenant_id = $1 AND name > $2 ORDER BY name LIMIT $3`
+	err := r.db.SelectContext(ctx, &apps, query, tenantID, afterName, limit)
 	return apps, err
 }
 

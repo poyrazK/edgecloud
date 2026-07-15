@@ -20,7 +20,7 @@ import (
 type mockAppRepo struct {
 	createFunc                func(ctx context.Context, app *domain.App) error
 	getFunc                   func(ctx context.Context, tenantID, appName string) (*domain.App, error)
-	listFunc                  func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error)
+	listFunc                  func(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error)
 	countByTenantFunc         func(ctx context.Context, tenantID string) (int, error)
 	atomicDeleteFunc          func(ctx context.Context, tenantID, appName string) (bool, error)
 	insertIfNotExistsFunc     func(ctx context.Context, app *domain.App) (bool, error)
@@ -53,9 +53,12 @@ func (m *mockAppRepo) Get(ctx context.Context, tenantID, appName string) (*domai
 	return nil, nil
 }
 
-func (m *mockAppRepo) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
+// Issue #58 — the mock matches the keyset signature change in
+// AppRepository.List. Callers of m.listFunc now pass
+// (tenantID, limit, afterName) instead of (tenantID, limit, offset).
+func (m *mockAppRepo) List(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error) {
 	if m.listFunc != nil {
-		return m.listFunc(ctx, tenantID, limit, offset)
+		return m.listFunc(ctx, tenantID, limit, afterName)
 	}
 	return nil, nil
 }
@@ -379,7 +382,7 @@ func TestAppService_List_HappyPath(t *testing.T) {
 		{ID: "a_2", TenantID: "t_tenant1", Name: "app-b"},
 	}
 	repo := &mockAppRepo{
-		listFunc: func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
+		listFunc: func(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error) {
 			return apps, nil
 		},
 	}
@@ -396,7 +399,7 @@ func TestAppService_List_HappyPath(t *testing.T) {
 
 func TestAppService_List_Empty(t *testing.T) {
 	repo := &mockAppRepo{
-		listFunc: func(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
+		listFunc: func(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error) {
 			return nil, nil
 		},
 	}

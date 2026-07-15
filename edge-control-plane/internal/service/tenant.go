@@ -402,7 +402,7 @@ func (s *TenantService) DeleteTenant(ctx context.Context, id string) error {
 		// tenantRepo.Delete below, so we need the names now to
 		// build the purge payloads. List runs against the same
 		// tx so it sees a consistent snapshot.
-		apps, err := s.appRepo.WithTx(tx).List(ctx, id, 1000, 0)
+		apps, err := s.appRepo.WithTx(tx).List(ctx, id, 1000, "")
 		if err != nil {
 			return fmt.Errorf("listing apps for purge: %w", err)
 		}
