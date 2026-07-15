@@ -337,7 +337,7 @@ jobs:
           file: edge-control-plane/Dockerfile
           tags: edgecloud/control-plane:test
           load: true
-          cache-from: type=gha,mode=max
+          cache-from: type=gha,mode=min
           cache-to: type=gha,mode=max,duration=336h
           provenance: false
 
@@ -348,7 +348,7 @@ jobs:
           file: edge-worker/Dockerfile
           tags: edgecloud/worker:test
           load: true
-          cache-from: type=gha,mode=max
+          cache-from: type=gha,mode=min
           cache-to: type=gha,mode=max,duration=336h
           provenance: false
 
@@ -359,7 +359,7 @@ jobs:
           file: edge-ingress/Dockerfile
           tags: edgecloud/ingress:test
           load: true
-          cache-from: type=gha,mode=max
+          cache-from: type=gha,mode=min
           cache-to: type=gha,mode=max,duration=336h
           provenance: false
 
