@@ -367,17 +367,17 @@ func freshWasmBytes() []byte {
 	return out
 }
 
-// newFirstDeployPostgres boots a testcontainer-managed Postgres
-// (postgres:16-alpine) unless DATABASE_HOST is set, in which case we
-// use the CI service — mirroring migrations/roundtrip_test.go's shape
-// and rollback_e2e_test.go's helper. Returns nil when the CI service
-// is in use; callers MUST check for nil before calling Terminate.
+// newFirstDeployPostgres always boots a testcontainer-managed
+// postgres:16-alpine. Unlike rollback_e2e_test.go (which falls back
+// to the CI service Postgres when DATABASE_HOST is set), this test
+// requires a hermetic DB because it mints fresh tenants with unique
+// names per run and asserts on the resulting row IDs. Sharing the CI
+// service DB across tests in the same `go-test-integration` matrix
+// job risks migration drift and cross-test tenant collisions.
+//
+// Returns the container; callers MUST Terminate in t.Cleanup.
 func newFirstDeployPostgres(t *testing.T, ctx context.Context) *tcpg.PostgresContainer {
 	t.Helper()
-	if os.Getenv("DATABASE_HOST") != "" {
-		t.Logf("using CI service postgres at %s", os.Getenv("DATABASE_HOST"))
-		return nil
-	}
 	c, err := tcpg.Run(ctx,
 		"postgres:16-alpine",
 		tcpg.WithDatabase("edgecloud_test"),
