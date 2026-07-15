@@ -145,10 +145,7 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
             .publish_delta(rid, &msg)
             .await
             .expect("publish");
-        publishers[i]
-            .flush()
-            .await
-            .expect("flush");
+        publishers[i].flush().await.expect("flush");
     }
 
     // Tick the aggregator until it sees all 3 replicas with the
