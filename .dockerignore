@@ -1,0 +1,54 @@
+# .dockerignore — controls what `docker build` ships in the build context.
+#
+# Each service's Dockerfile copies only the slice of the workspace it
+# needs (e.g. the control-plane Dockerfile only `COPY`s the
+# `edge-control-plane/` tree), so this file mostly catches stray files
+# that end up in the context root and bloat layer sizes.
+
+# Build outputs from Cargo (workspace + subcrates) and Go
+target/
+**/target/
+**/.target-cache/
+target-cache/
+
+# Build artifacts / fixtures
+*.wasm
+*.wat
+*.cwasm
+**/*.wasm.*
+samples/*/target/
+
+# Secrets, keys, runtime state
+.env
+**/.env
+**/.env.local
+**/.env.*.local
+*.key
+*.pem
+signing.key
+identity.key
+.worker-cache/
+.worker-spool/
+.cache/
+**/config.local.yaml
+**/config.yaml.encrypted
+
+# Logs / OS / editor cruft
+*.log
+**/*.log
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Tooling — never shipped in a runtime image
+.git/
+.gitignore
+.github/
+.claude/
+.idea/
+.vscode/
+
+# CI/build caches specific to this repo
+.swatinem-cache/
+.sccache/

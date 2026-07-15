@@ -14,6 +14,8 @@ Cargo.lock
 *.wat
 *.log
 .env
+.env.prod
+.env.smoke
 .DS_Store
 *.swp
 *.swo
@@ -30,3 +32,10 @@ edge-control-plane/config.local.yaml
 # but the wildcard covers both, which is the safe default.
 *.key
 signing.key
+# Production compose (issue #512) operator secrets + per-host state:
+#   secrets/  — operator-generated signing keyring + bootstrap seed
+#   tls/      — TLS cert pair mounted into the ingress container
+#   docker-compose.prod/caddy.local.json — envsubst'd from caddy.json with the operator's CADDY_ADMIN_TOKEN
+secrets/
+tls/
+docker-compose.prod/caddy.local.json
