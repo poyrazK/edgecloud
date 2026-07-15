@@ -742,3 +742,72 @@ async fn apps_create_and_get_reject_invalid_app_name() {
         common::assert_invalid_path_component(cmd, expected_substr);
     }
 }
+
+/// Issue #60: a 5xx from the server (cascade failure or post-commit
+/// artifact-cleanup failure per the new atomic AppService.Delete
+/// contract) must surface as a non-zero exit, not silent success.
+/// `ApiClient::delete_app` classifies 5xx as Transient and reroutes
+/// through `call_with_retry_no_interrupt`. After exhausting retries
+/// the CLI bails with a non-zero exit — distinct from the 404
+/// (`apps_delete_propagates_404_for_missing_app`) and the role
+/// mismatch (`apps_delete_preflight_whoami_surfaces_role_mismatch`)
+/// paths.
+#[tokio::test]
+async fn apps_delete_returns_500_after_retries() {
+    let home = common::isolated_home();
+    let project = common::isolated_home();
+    write_minimal_edge_toml(&project);
+    let server = MockServer::start().await;
+
+    common::seed_api_key(&home, "k_seed");
+
+    Mock::given(method("GET"))
+        .and(path("/api/v1/auth/whoami"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tenant_id": "t_seed",
+            "tenant_name": "Seed",
+            "plan": "free",
+            "api_key_id": "k_seed",
+            "api_key_name": "default",
+            "role": "owner",
+            "created_at": "2026-06-20T00:00:00Z",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Server always returns 500 — transient classification means
+    // the CLI retries up to DEFAULT_MAX_RETRIES (3) attempts.
+    Mock::given(method("DELETE"))
+        .and(path("/api/v1/admin/apps/myapp"))
+        .and(header("Authorization", "Bearer k_seed"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("cascade failure"))
+        .expect(4) // 1 initial + 3 retries
+        .mount(&server)
+        .await;
+
+    let mut cmd = Command::cargo_bin("edge").unwrap();
+    common::set_platform_env(&mut cmd, &home);
+    cmd.current_dir(project.path());
+    cmd.env("EDGE_API_URL", server.uri());
+    // EDGE_CLI_RETRY_BASE_MS is a test-only hook (see `commands/retry.rs`)
+    // that shrinks the default 500ms backoff below the 15s test timeout.
+    cmd.env("EDGE_CLI_RETRY_BASE_MS", "10");
+    cmd.timeout(std::time::Duration::from_secs(15));
+    cmd.arg("apps").arg("delete").arg("myapp").arg("--yes");
+
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("apps delete failed"));
+
+    let received = server.received_requests().await.expect("received");
+    let delete_count = received
+        .iter()
+        .filter(|r| r.method.as_str() == "DELETE" && r.url.path() == "/api/v1/admin/apps/myapp")
+        .count();
+    assert_eq!(
+        delete_count, 4,
+        "expected 1 initial + 3 retries = 4 DELETE attempts on /api/v1/admin/apps/myapp"
+    );
+}
