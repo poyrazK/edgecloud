@@ -131,6 +131,25 @@ type AppStatus struct {
 	// Used by service.WorkerService.checkComputeMs to accumulate into
 	// quotas.used_compute_ms.
 	DurationMsTotal *uint64 `json:"duration_ms_total,omitempty"`
+	// Status5xxCount is the total per-request 5xx error count
+	// served by this app since the last heartbeat interval
+	// (issue #84 asks 6/7, fifth metered dimension). The FaaS
+	// dispatch path stamps `meter.record_error()` from the
+	// `synthetic_500` chokepoint shared by the three error
+	// terminal arms of `handle_request`. NOT stamped on the
+	// body-cap 413 early return — that is a tenant-config
+	// violation, not a guest error. LongRunning apps stamp 0
+	// (the dispatch path never fires for LR). Defaults to 0
+	// when absent — the canary auto-ramp service
+	// (`service.CanaryRampService`) treats the absent case as
+	// "no errors this interval" — same rolling-upgrade contract
+	// as DurationMsTotal (issue #555) and OutboundBytes
+	// (issue #210). `Status5xxCountOrZero()` mirrors the
+	// `DurationMsTotalOrZero()` / `ResidentSecondsOrZero()`
+	// helpers (see below) so the field selector passed into
+	// applyTenantDelta-style call sites stays `func(*AppStatus)
+	// uint64` (a method value, not a closure).
+	Status5xxCount uint64 `json:"status_5xx_count,omitempty"`
 	// Protocol is the wire protocol this app speaks (issue #548).
 	// Either "http" (the default — long-running HTTP/WS apps or FaaS
 	// apps served via the existing Caddy reverse_proxy) or "tcp"
@@ -167,6 +186,21 @@ func (a *AppStatus) DurationMsTotalOrZero() uint64 {
 		return 0
 	}
 	return *a.DurationMsTotal
+}
+
+// Status5xxCountOrZero returns the 5xx error counter treated as a
+// scalar (issue #84 asks 6/7). Unlike the optional-pointer
+// dimensions (ResidentSeconds / DurationMsTotal), this field is a
+// bare `uint64` because the wire side (`#[serde(default)]` on the
+// Rust AppStatus) already folds absent → 0 at deserialization —
+// there's no `nil` state on the Go side to distinguish. The helper
+// exists for API symmetry with ResidentSecondsOrZero /
+// DurationMsTotalOrZero so the field selector passed into
+// applyTenantDelta-style call sites stays `func(*AppStatus) uint64`
+// (a method value, not a closure). Pre-#84 workers (the rolling
+// upgrade window) decode to 0 here.
+func (a *AppStatus) Status5xxCountOrZero() uint64 {
+	return a.Status5xxCount
 }
 
 // AppTarget describes a running app reachable on a worker — what the
