@@ -407,15 +407,26 @@ func New(
 	// TenantsHostedBy(ctx, workerID) method (issue #491 constraint
 	// #2) that the gate uses to refuse tokens for tenants the worker
 	// isn't currently hosting.
+	// Issue #713: build one shared *middleware.WorkerKeyCache and
+	// thread it into BOTH NewInternalHandler (so resolvePerWorkerSigningKey
+	// can re-derive the per-worker HS256 secret for POST /tokens/tenant
+	// mints) AND the route-middleware workerJWTConfig below (so
+	// WorkerAuth's wkr_ verify branch hits the same cache). Without the
+	// share, InternalHandler holds a nil cache and MintWorkerToken
+	// nil-panics on every cold-boot call after the worker has heartbeated
+	// a running app (issue #642 regression marker).
+	workerKeyCache := middleware.NewWorkerKeyCache(workerRepo.GetPublicKey)
+
 	internalHandler := handler.NewInternalHandler(
 		deploymentSvc, workerSvc, domainSvc, logEntryRepo,
 		reconcileSvc, reconcileSvc,
 		cfg.Region, cfg.BootstrapSecret, cfg.JWT.Secret,
 		middleware.WorkerJWTConfig{
-			Secret:    cfg.JWT.Secret,
-			Issuer:    cfg.JWT.Issuer,
-			ActiveKID: cfg.JWT.ActiveKID,
-			Keys:      cfg.JWT.Keys,
+			Secret:         cfg.JWT.Secret,
+			Issuer:         cfg.JWT.Issuer,
+			ActiveKID:      cfg.JWT.ActiveKID,
+			Keys:           cfg.JWT.Keys,
+			WorkerKeyCache: workerKeyCache,
 		},
 		cfg.JWT.WorkerTokenTTL,
 		cfg.JWT.Issuer,
@@ -824,15 +835,12 @@ presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset]
 		Issuer:    cfg.JWT.Issuer,
 		ActiveKID: cfg.JWT.ActiveKID,
 		Keys:      cfg.JWT.Keys,
-		// Issue #430: wire the per-worker public-key cache. The
-		// loader hits workers.public_key (migration 032) once
-		// per cache miss; subsequent inbound requests for the
-		// same worker_id short-circuit and re-derive the
-		// verification secret via HKDF without touching the DB.
-		// EnrollWorker calls Invalidate after a fresh
-		// SetPublicKey, so a worker that just re-enrolled
-		// doesn't have to wait out the 5-minute TTL.
-		WorkerKeyCache: middleware.NewWorkerKeyCache(workerRepo.GetPublicKey),
+		// Issue #713: share the same *WorkerKeyCache instance with
+		// NewInternalHandler above. EnrollWorker calls Invalidate on
+		// this same instance after a fresh SetPublicKey, so a worker
+		// that just re-enrolled doesn't have to wait out the 5-minute
+		// TTL on either the verify or the mint side.
+		WorkerKeyCache: workerKeyCache,
 	}
 
 	// Bootstrap endpoint (issue #104): no auth middleware — uses HMAC
