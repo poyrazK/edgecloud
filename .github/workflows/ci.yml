@@ -275,10 +275,19 @@ jobs:
     # We pin SCCACHE off in this job. The .cargo/config.toml
     # already sets `rustc-wrapper = "sccache"`, but sccache's local
     # disk cache can't share state across Docker build invocations
-    # on the same runner. BuildKit's cache-to=type=gha is the
-    # equivalent for cross-invocation reuse. Each Dockerfile
-    # overrides CARGO_BUILD_RUSTC_WRAPPER="" inside the builder
-    # stage so the wrapper is bypassed during Docker builds.
+    # on the same runner. Each Dockerfile overrides
+    # CARGO_BUILD_RUSTC_WRAPPER="" inside the builder stage so the
+    # wrapper is bypassed during Docker builds. The cargo registry
+    # + target-dir are cached via actions/cache@v5 below — that's
+    # the primary cross-invocation reuse mechanism (cargo fetch +
+    # cargo build reuse), keeping cold builds at ~25 min and
+    # warm builds at ~2 min. BuildKit's gha cache backend is
+    # deliberately omitted: it consistently errors on this repo's
+    # `COPY Cargo.toml Cargo.lock ./` step with
+    # `failed to calculate checksum of ref <X>: "/Cargo.lock": not
+    # found` even on the first-ever build with no prior cache
+    # refs (BuildKit v0.30.0 gha-backend bug). The cargo registry
+    # cache + cold-layer rebuild is the supported path.
     env:
       CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
@@ -337,8 +346,6 @@ jobs:
           file: edge-control-plane/Dockerfile
           tags: edgecloud/control-plane:test
           load: true
-          cache-from: type=gha,scope=build-images-cp,mode=min
-          cache-to: type=gha,scope=build-images-cp,mode=max,duration=336h
           provenance: false
 
       - name: Build worker image
@@ -348,8 +355,6 @@ jobs:
           file: edge-worker/Dockerfile
           tags: edgecloud/worker:test
           load: true
-          cache-from: type=gha,scope=build-images-worker,mode=min
-          cache-to: type=gha,scope=build-images-worker,mode=max,duration=336h
           provenance: false
 
       - name: Build ingress image
@@ -359,8 +364,6 @@ jobs:
           file: edge-ingress/Dockerfile
           tags: edgecloud/ingress:test
           load: true
-          cache-from: type=gha,scope=build-images-ingress,mode=min
-          cache-to: type=gha,scope=build-images-ingress,mode=max,duration=336h
           provenance: false
 
       # Smoke: each image runs and answers a basic liveness check.

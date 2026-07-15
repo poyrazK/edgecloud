@@ -87,9 +87,13 @@ overrides: every Dockerfile sets `CARGO_BUILD_RUSTC_WRAPPER=""` +
 `CARGO_TARGET_DIR=/build/target` in its Rust builder stage to sidestep
 `.cargo/config.toml`'s sccache + config-relative target-dir (which
 would point at the wrong place inside Docker). Caching is BuildKit
-`cache-from: type=gha,mode=max` + `--mount=type=cache` for the cargo
-registry; layer reuse is what makes the second CI build drop from
-~25 min to ~2 min.
+`--mount=type=cache` for the cargo registry inside Docker (via
+`actions/cache@v5` keyed on `**/Cargo.lock`); layer reuse is what
+makes the second CI build drop from ~25 min to ~2 min. BuildKit's
+`type=gha` cache backend was tried and rejected — see the
+build-images job comment in `.github/workflows/ci.yml` for the
+specific `failed to calculate checksum of ref <X>: "/Cargo.lock":
+not found` failure mode.
 
 Use `make prod-up` / `make prod-smoke` / `make prod-reset` to drive
 the stack. Pre-flight, copy `.env.prod.example` to `.env.prod` and
@@ -128,7 +132,7 @@ CI jobs:
 | `typos` | crate-ci/typos across the whole repo |
 | `coverage-rust` | cargo-llvm-cov (informational) |
 | `rust-js-build` | Exercises the JS build pipeline end-to-end (`rustup target add wasm32-wasip1` + esbuild + `wasm-tools component new --adapt <vendored adapter>` against `samples/hello-js-ws/`); also verifies the vendored WASI Preview 1 reactor adapter via `sha256sum -c edge-cli/adapters/SHA256SUMS` (issue #423). |
-| `build-images` | Builds the three service Dockerfiles (`edge-{control-plane,worker,ingress}/Dockerfile`) with `docker/build-push-action@v6` + `cache-from: type=gha,mode=max`. Runs on every PR + push. Layer cache shares compiled Cargo registry across runs (issue #512). |
+| `build-images` | Builds the three service Dockerfiles (`edge-{control-plane,worker,ingress}/Dockerfile`) with `docker/build-push-action@v6`. Cargo registry + target dir cached via `actions/cache@v5` keyed on `**/Cargo.lock` (issue #512). No BuildKit `type=gha` cache backend — see job comment for the BuildKit gha-backend bug we're sidestepping. |
 | `compose-smoke` | Boots `docker-compose.prod.yml`, polls CP `/ready` (deep readiness per issue #48), uploads failure logs as an artifact. Gated on `push to main` only (skips PRs). Same scope as #577, merged into #512's PR. |
 
 `.github/workflows/preview.yml` is a `deploy-preview` job that runs on every PR `opened`/`synchronize` event (issue #308). The composite action at `.github/actions/deploy-preview/action.yml` builds the CLI via `cargo install --root $CARGO_HOME`, then runs `edge deploy --preview --pr-number=${{ github.event.pull_request.number }}`. The action includes a `Expose edge CLI on PATH` step that appends `$CARGO_HOME/bin` to `$GITHUB_PATH` — without it the next bash step fails with `edge: command not found` (rc=127). The URL is parsed from the CLI's stdout and exposed as the `preview-url` step output; the workflow's `Comment PR` step posts it on the PR when `EDGECLOUD_API_KEY` is set (fork PRs lack the secret and silently no-op).
