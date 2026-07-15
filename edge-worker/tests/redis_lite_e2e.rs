@@ -92,13 +92,16 @@ async fn redis_lite_structural_contract() {
         return;
     }
     // Hard outer timeout: defense-in-depth — a single stuck test must
-    // not be able to wedge the whole CI job.
+    // not be able to wedge the whole CI job. 180s covers supervisor
+    // boot (~30s cold) + heartbeat poll (30s) + TCP-probe (30s) + the
+    // guest's first cold RESP round-trip (5-30s) + the metering
+    // assertion. Mirrors the persistence test's outer budget.
     timeout(
-        Duration::from_secs(120),
+        Duration::from_secs(180),
         redis_lite_structural_contract_inner(),
     )
     .await
-    .expect("redis_lite_structural_contract timed out after 120s");
+    .expect("redis_lite_structural_contract timed out after 180s");
 }
 
 async fn redis_lite_structural_contract_inner() {
@@ -402,9 +405,16 @@ async fn resp_round_trip(port: u16, cmd: &[u8], expected: &[u8]) {
     };
     sock.write_all(cmd).await.expect("write cmd");
     let mut buf = vec![0u8; expected.len()];
-    timeout(Duration::from_secs(5), sock.read_exact(&mut buf))
+    // 30s for read_exact: a cold-runner second-boot of the redis-lite
+    // guest (the persistence test's first GET on the new supervisor)
+    // can spend 5-10s on download + signature verify + instantiate +
+    // start_bind + finish_listen before the first accept fires. 5s was
+    // tight enough to flake on CI. 30s is also the TCP-connect budget
+    // above — symmetric, and well under the test's outer 120s/180s
+    // timeouts.
+    timeout(Duration::from_secs(30), sock.read_exact(&mut buf))
         .await
-        .expect("read_exact timed out after 5s")
+        .expect("read_exact timed out after 30s")
         .expect("read_exact failed");
     assert_eq!(buf, expected, "unexpected RESP reply");
 }
