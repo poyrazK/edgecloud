@@ -16,7 +16,7 @@ import (
 type mockAppSvc struct {
 	createApp *domain.App
 	createErr error
-	listApps  []domain.App
+	listPage  *service.AppListPage
 	listErr   error
 	getApp    *domain.App
 	getErr    error
@@ -35,8 +35,8 @@ type mockAppSvc struct {
 func (m *mockAppSvc) Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error) {
 	return m.createApp, m.createErr
 }
-func (m *mockAppSvc) List(ctx context.Context, tenantID string, limit, offset int) ([]domain.App, error) {
-	return m.listApps, m.listErr
+func (m *mockAppSvc) List(ctx context.Context, tenantID string, limit int, afterCursor string) (*service.AppListPage, error) {
+	return m.listPage, m.listErr
 }
 func (m *mockAppSvc) Get(ctx context.Context, tenantID, appName string) (*domain.App, error) {
 	if m.getErr != nil {
@@ -133,11 +133,62 @@ func TestAppHandler_Create_QuotaExceeded(t *testing.T) {
 	}
 }
 
-func TestAppHandler_List(t *testing.T) {
-	svc := &mockAppSvc{listApps: []domain.App{}}
+// TestAppHandler_List_FirstPage covers the happy-path first-page
+// request: no `?cursor=`, no `?offset=`, no `?limit=`. Verifies
+// that the response envelope carries `{apps, limit}` and that
+// `next_cursor` is OMITTED (omitempty) when the service returns
+// nil. Issue #58.
+func TestAppHandler_List_FirstPage(t *testing.T) {
+	svc := &mockAppSvc{listPage: &service.AppListPage{
+		Apps:       []domain.App{},
+		Limit:      50,
+		NextCursor: nil,
+	}}
 	mux := newAppMux(svc)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/apps", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	// Decode into a generic map so we can assert field presence
+	// and absence (next_cursor must be missing on the final page).
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := resp["apps"]; !ok {
+		t.Error("response missing 'apps' field")
+	}
+	if v, ok := resp["limit"].(float64); !ok || int(v) != 50 {
+		t.Errorf("limit = %v, want 50", resp["limit"])
+	}
+	if _, hasNext := resp["next_cursor"]; hasNext {
+		t.Errorf("response has 'next_cursor' on final page; want omitted (omitempty)")
+	}
+	// Issue #58 — offset is gone entirely.
+	if _, hasOff := resp["offset"]; hasOff {
+		t.Errorf("response has 'offset'; the apps envelope is hard-cut (issue #58)")
+	}
+}
+
+// TestAppHandler_List_HasMore_EmitsNextCursor pins the
+// limit+1-probe + cursor-encode path: when the service returns a
+// page with NextCursor, the envelope MUST serialize it as a
+// base64url string under the `next_cursor` key.
+func TestAppHandler_List_HasMore_EmitsNextCursor(t *testing.T) {
+	cursor := "eyJ2IjoxLCJwIjp7Im5hbWUiOiJiYXR0In19"
+	svc := &mockAppSvc{listPage: &service.AppListPage{
+		Apps:       []domain.App{{ID: "a_1", Name: "alpha"}, {ID: "a_2", Name: "batt"}},
+		Limit:      50,
+		NextCursor: &cursor,
+	}}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/apps?limit=50", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -149,9 +200,135 @@ func TestAppHandler_List(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp["limit"] == nil || resp["offset"] == nil {
-		t.Error("response missing limit/offset")
+	if v, ok := resp["next_cursor"].(string); !ok || v != cursor {
+		t.Errorf("next_cursor = %v, want %q", resp["next_cursor"], cursor)
 	}
+}
+
+// TestAppHandler_List_BadCursor_400 — a malformed cursor string
+// must surface as 400 with the generic "invalid cursor" message,
+// never 500. Mirrors the typed-error contract at
+// handler/webhook.go:199-207.
+func TestAppHandler_List_BadCursor_400(t *testing.T) {
+	svc := &mockAppSvc{listErr: service.ErrInvalidAppCursor}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/apps?cursor=garbage", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "invalid cursor") {
+		t.Errorf("body = %q, want substring 'invalid cursor'", rr.Body.String())
+	}
+}
+
+// TestAppHandler_List_RejectsCursorAndOffset_400 — a request that
+// supplies BOTH `?cursor=` and `?offset=` is rejected as 400 even
+// though `?offset=` is no longer advertised. Mirrors the
+// handler/webhook.go:179-185 idiom.
+func TestAppHandler_List_RejectsCursorAndOffset_400(t *testing.T) {
+	svc := &mockAppSvc{}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/apps?cursor=eyJ2Ijox&offset=10", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "mutually exclusive") {
+		t.Errorf("body = %q, want substring 'mutually exclusive'", rr.Body.String())
+	}
+}
+
+// TestAppHandler_List_BadLimit_400 — a non-numeric or non-positive
+// `?limit=` returns 400 with the generic "invalid limit" message.
+// The cap-clamping path (limit > 500) is tested separately as
+// TestAppHandler_List_ClampsLimit.
+func TestAppHandler_List_BadLimit_400(t *testing.T) {
+	svc := &mockAppSvc{}
+	mux := newAppMux(svc)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/apps?limit=abc", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for non-numeric limit", rr.Code)
+	}
+}
+
+// TestAppHandler_List_ClampsLimit pins the silent cap on
+// `?limit=` > appsLimitCap (500). The handler must clamp AND
+// report the effective limit in the response so the caller can
+// learn the cap without consulting docs.
+func TestAppHandler_List_ClampsLimit(t *testing.T) {
+	// The mock records the limit it received; if clamping works the
+	// service should see 500, not 5000.
+	var seenLimit int
+	svc := &mockAppSvc{
+		listPage: &service.AppListPage{Apps: nil, Limit: 0, NextCursor: nil},
+	}
+	// Wrap so we can spy on the limit argument.
+	wrapped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Re-call svc.List with the same arguments via a wrapper
+		// service isn't easy — instead, assert on the response
+		// `limit` field which the handler reports from page.Limit
+		// (the effective limit the service was called with).
+		_ = seenLimit
+		h := &AppHandler{appSvc: &limitSpy{inner: svc, got: &seenLimit}}
+		h.List(w, r)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/apps?limit=5000", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	wrapped.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if seenLimit != appsLimitCap {
+		t.Errorf("service called with limit=%d, want %d (clamped)", seenLimit, appsLimitCap)
+	}
+}
+
+// limitSpy wraps a mockAppSvc to record the limit argument. Used
+// only by TestAppHandler_List_ClampsLimit so we can assert the
+// clamp without an extra field on the public mock struct.
+type limitSpy struct {
+	inner *mockAppSvc
+	got   *int
+}
+
+func (s *limitSpy) Create(ctx context.Context, tenantID, appName string, req *domain.CreateAppRequest) (*domain.App, error) {
+	return s.inner.Create(ctx, tenantID, appName, req)
+}
+func (s *limitSpy) List(ctx context.Context, tenantID string, limit int, afterCursor string) (*service.AppListPage, error) {
+	*s.got = limit
+	return s.inner.List(ctx, tenantID, limit, afterCursor)
+}
+func (s *limitSpy) Get(ctx context.Context, tenantID, appName string) (*domain.App, error) {
+	return s.inner.Get(ctx, tenantID, appName)
+}
+func (s *limitSpy) Update(ctx context.Context, tenantID, appName string, req *domain.UpdateAppRequest) (*domain.App, error) {
+	return s.inner.Update(ctx, tenantID, appName, req)
+}
+func (s *limitSpy) Delete(ctx context.Context, tenantID, appName string) error {
+	return s.inner.Delete(ctx, tenantID, appName)
+}
+func (s *limitSpy) GetL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	return s.inner.GetL4Port(ctx, tenantID, appName)
+}
+func (s *limitSpy) AllocateL4Port(ctx context.Context, tenantID, appName string) (uint16, error) {
+	return s.inner.AllocateL4Port(ctx, tenantID, appName)
 }
 
 func TestAppHandler_Get_Found(t *testing.T) {

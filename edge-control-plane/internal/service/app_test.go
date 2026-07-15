@@ -388,12 +388,100 @@ func TestAppService_List_HappyPath(t *testing.T) {
 	}
 	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
-	got, err := svc.List(context.Background(), "t_tenant1", 50, 0)
+	page, err := svc.List(context.Background(), "t_tenant1", 50, "")
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(got) != 2 {
-		t.Errorf("len(got) = %d, want 2", len(got))
+	if len(page.Apps) != 2 {
+		t.Errorf("len(page.Apps) = %d, want 2", len(page.Apps))
+	}
+	if page.Limit != 50 {
+		t.Errorf("page.Limit = %d, want 50", page.Limit)
+	}
+	if page.NextCursor != nil {
+		t.Errorf("page.NextCursor = %v, want nil (final page)", *page.NextCursor)
+	}
+}
+
+// TestAppService_List_HasMore_DetectsExtraRow pins the limit+1 fetch
+// + cursor-encode contract (issue #58). When the repo returns
+// limit+1 rows the service must (a) trim to limit and (b) emit a
+// NextCursor from the last visible row's name.
+func TestAppService_List_HasMore_DetectsExtraRow(t *testing.T) {
+	// Mock returns limit+1 = 4 rows when the service asks for 3.
+	repo := &mockAppRepo{
+		listFunc: func(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error) {
+			if limit != 4 {
+				t.Errorf("service asked for limit=%d, want 4 (limit+1 probe)", limit)
+			}
+			return []domain.App{
+				{ID: "a_1", Name: "alpha"},
+				{ID: "a_2", Name: "beta"},
+				{ID: "a_3", Name: "gamma"},
+				{ID: "a_4", Name: "delta"}, // trailing probe row
+			}, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	page, err := svc.List(context.Background(), "t_tenant1", 3, "")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(page.Apps) != 3 {
+		t.Errorf("len(page.Apps) = %d, want 3 (trailing row dropped)", len(page.Apps))
+	}
+	if page.Apps[2].Name != "gamma" {
+		t.Errorf("page.Apps[2].Name = %q, want gamma", page.Apps[2].Name)
+	}
+	if page.NextCursor == nil {
+		t.Fatal("page.NextCursor is nil, want a value")
+	}
+	// Round-trip the cursor back through decodeAppCursor to make sure
+	// the encoded form is what the service expects on the next page.
+	got, err := decodeAppCursor(*page.NextCursor)
+	if err != nil {
+		t.Fatalf("decodeAppCursor: %v", err)
+	}
+	if got != "gamma" {
+		t.Errorf("cursor decoded name = %q, want gamma", got)
+	}
+}
+
+// TestAppService_List_BadCursor pins the typed-error path (issue #58).
+// A malformed cursor returns ErrInvalidAppCursor so the handler can
+// map it to 400 without leaking decoder internals.
+func TestAppService_List_BadCursor(t *testing.T) {
+	repo := &mockAppRepo{
+		listFunc: func(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error) {
+			t.Fatal("repo.List must NOT be called when cursor decode fails")
+			return nil, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	_, err := svc.List(context.Background(), "t_tenant1", 50, "@@@not-base64@@@")
+	if !errors.Is(err, ErrInvalidAppCursor) {
+		t.Errorf("err = %v, want ErrInvalidAppCursor", err)
+	}
+}
+
+// TestAppService_List_InvalidLimit pins the defense-in-depth guard
+// against a non-positive limit. The handler clamps before calling;
+// this is the belt-and-suspenders layer so a future regression can't
+// silently trigger a SELECT with LIMIT 0.
+func TestAppService_List_InvalidLimit(t *testing.T) {
+	repo := &mockAppRepo{
+		listFunc: func(ctx context.Context, tenantID string, limit int, afterName string) ([]domain.App, error) {
+			t.Fatal("repo.List must NOT be called when limit <= 0")
+			return nil, nil
+		},
+	}
+	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
+
+	_, err := svc.List(context.Background(), "t_tenant1", 0, "")
+	if !errors.Is(err, ErrInvalidLimit) {
+		t.Errorf("err = %v, want ErrInvalidLimit", err)
 	}
 }
 
@@ -405,12 +493,15 @@ func TestAppService_List_Empty(t *testing.T) {
 	}
 	svc := appSvcForTest(repo, &mockQuotaRepoForApps{})
 
-	got, err := svc.List(context.Background(), "t_tenant1", 50, 0)
+	page, err := svc.List(context.Background(), "t_tenant1", 50, "")
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("len(got) = %d, want 0", len(got))
+	if len(page.Apps) != 0 {
+		t.Errorf("len(page.Apps) = %d, want 0", len(page.Apps))
+	}
+	if page.NextCursor != nil {
+		t.Errorf("page.NextCursor = %v, want nil (empty repo → final page)", *page.NextCursor)
 	}
 }
 
