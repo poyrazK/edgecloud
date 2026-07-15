@@ -1,13 +1,20 @@
 //! URL path-component validator for the edge CLI.
 //!
 //! The Go control plane's [`validatePathComponent`] defends server-side
-//! against filesystem-path-traversal (`\0`, `/`, `\`, `..`). This module
-//! is the **defense-in-depth client-side pre-flight guard** applied
-//! before every path-interpolating URL build. It is strictly stricter
-//! than the Go helper — it also rejects whitespace, control chars,
-//! percent signs, and any non-ASCII — so an invalid input surfaces an
-//! actionable error before any round-trip, instead of silently arriving
-//! at the server as a malformed URI.
+//! against filesystem-path-traversal (`\0`, `/`, `\`, `..`) — its
+//! threat model is *disk-path*: it guards writes under
+//! `cfg.Storage.ArtifactPath`. This module is the **defense-in-depth
+//! client-side pre-flight guard** applied before every
+//! path-interpolating URL build. Its threat model is *outbound URI
+//! character*: it never writes to disk, so the allow set can be
+//! tighter (no percent, no whitespace, no control chars, no non-ASCII)
+//! without breaking any legitimate CLI use case. The two helpers share
+//! the same allow-set philosophy — `[A-Za-z0-9._~-]` plus the
+//! `..`-rejection — but the CLI helper rejects strictly more, because
+//! there is no filesystem I/O to defend.
+//!
+//! Invalid input surfaces an actionable error before any round-trip,
+//! instead of silently arriving at the server as a malformed URI.
 //!
 //! Does **not** percent-encode. A value like `"my app"` (with a space)
 //! refuses with a clear error rather than silently encoding to
@@ -28,6 +35,11 @@
 /// Rejects: empty, `..` (literal or substring), `\0`, `/`, `\`, `?`,
 /// `#`, `&`, `=`, `+`, `%`, ASCII whitespace, tab/newline/CR, control
 /// chars, and any non-ASCII character. Allow set is `[A-Za-z0-9._~-]`.
+///
+/// `#[must_use]` prevents a future caller from `.ok();`-ing the result
+/// and silently dropping a validation failure — every site today binds
+/// it via `?` or `.map_err`, but the attribute is cheap insurance.
+#[must_use = "validating a path component must not be silently discarded — bind via `?` or `.map_err`"]
 pub fn validate_path_component(name: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("{name} cannot be empty");
@@ -107,6 +119,50 @@ mod tests {
             "a?b", "a#b", "a&b", "a=b", "a+b", "a%b", "a b", "a\tb", "a\nb",
         ] {
             let err = validate_path_component("p", v).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid character"),
+                "{v:?}: {err}"
+            );
+        }
+    }
+
+    /// `is_control()` covers both C0 (`\x00`–`\x1f`) and DEL (`\x7f`),
+    /// and C1 (`\x80`–`\x9f`). The literals `\t` (`\x09`), `\n`
+    /// (`\x0a`), `\r` (`\x0d`) are technically redundant with
+    /// `is_control()`, but the test matrix explicitly covers them
+    /// alongside the dedicated `is_control()` arms so a future
+    /// refactor that drops the literal list still has to make
+    /// these tests pass.
+    #[test]
+    fn rejects_control_chars_via_is_control() {
+        // C0 + DEL: classic ASCII control block, plus the explicit
+        // tab/newline/CR (covered by both the literal list and
+        // `is_control()`).
+        for v in [
+            "a\x01b",      // SOH
+            "a\x07b",      // BEL
+            "a\x0bb",      // vertical tab (C0 control, not in literal list)
+            "a\x1fb",      // unit separator
+            "a\x7fb",      // DEL
+        ] {
+            let err = validate_path_component("p", v).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid character"),
+                "{v:?}: {err}"
+            );
+        }
+
+        // C1 controls: the bytes \x80..\x9f are *not* literal-listed,
+// but `is_control()` catches them. This is the path that a
+// misclassified "non-ASCII" check might miss — pin it. C1 controls
+// are valid Unicode codepoints (U+0080..U+009F) but are not valid
+// UTF-8 single-byte sequences; encode them via `char::from_u32`.
+        for v in [
+            format!("a{}b", char::from_u32(0x80).unwrap()),
+            format!("a{}b", char::from_u32(0x8F).unwrap()),
+            format!("a{}b", char::from_u32(0x9F).unwrap()),
+        ] {
+            let err = validate_path_component("p", &v).unwrap_err();
             assert!(
                 err.to_string().contains("invalid character"),
                 "{v:?}: {err}"

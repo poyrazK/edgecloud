@@ -103,9 +103,19 @@ pub fn seed_api_key(home: &TempDir, key: &str) {
 /// the resulting `Command` here. The caller has already `.arg(...)`'d
 /// the offending identifier onto `cmd`.
 ///
-/// The test asserts `.failure()` and that stderr contains the
-/// substring — the precise substring depends on which validator arm
-/// fires (`cannot be empty`, `'..'`, `invalid character`).
+/// The test asserts:
+///   * exit code 1 (validator bail via `anyhow::bail!` propagating
+///     through `fn main() -> Result<()>` — distinct from clap parse
+///     errors, which surface as exit code 2; matters for `set -e`
+///     users who distinguish the two).
+///   * stderr contains the expected substring — the precise substring
+///     depends on which validator arm fires (`cannot be empty`,
+///     `'..'`, `invalid character`).
+///
+/// `#[track_caller]`: on assertion failure, the panic frame points at
+/// the *test* that called this helper, not at the helper's body. Makes
+/// the failing case easier to localize across the 12 test files that
+/// route through it.
 ///
 /// `#[allow(dead_code)]`: each integration test binary is compiled
 /// separately, and binaries that don't use this helper (e.g.
@@ -113,9 +123,10 @@ pub fn seed_api_key(home: &TempDir, key: &str) {
 /// as dead. The helper is intentionally shared; the allow is scoped
 /// to one line.
 #[allow(dead_code)]
+#[track_caller]
 pub fn assert_invalid_path_component(mut cmd: Command, expected_stderr_substr: &str) {
     cmd.assert()
-        .failure()
+        .code(1)
         .stderr(predicates::prelude::predicate::str::contains(
             expected_stderr_substr,
         ));
