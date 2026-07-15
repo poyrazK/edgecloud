@@ -397,13 +397,15 @@ async fn test_app_lifecycle() {
         "app should be Running within 10s (check NATS connectivity and component compilation)"
     );
 
-    // Step 3: heartbeat should include the app
+    // Step 3: heartbeat should include the app.
+    // Post-#290 the key is "{app_name}:{deployment_id}".
     let heartbeat = harness.supervisor.build_heartbeat().await;
+    let wire_key = "test-app:d_deploy_001".to_string();
     assert!(
-        heartbeat.apps.contains_key("test-app"),
-        "heartbeat should contain test-app"
+        heartbeat.apps.contains_key(&wire_key),
+        "heartbeat should contain {wire_key}"
     );
-    let app_status = heartbeat.apps.get("test-app").unwrap();
+    let app_status = heartbeat.apps.get(&wire_key).unwrap();
     assert_eq!(
         app_status.status, "running",
         "app status should be 'running'"

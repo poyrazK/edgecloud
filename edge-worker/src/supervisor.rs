@@ -2145,20 +2145,13 @@ impl Supervisor {
             "starting app"
         );
 
-        // Stop existing instance if present (for this tenant + app + deployment).
-        // Use the previous deployment_id if there was one for this (tenant, app).
-        let existing_deployment_id = {
-            let state = self.state.read().await;
-            state
-                .apps
-                .keys()
-                .find(|(t, n, _d)| t == tenant_id && n == app_name)
-                .map(|(_, _, d)| d.clone())
-        };
-        if let Some(prev_deployment_id) = existing_deployment_id {
-            self.stop_app(tenant_id, app_name, &prev_deployment_id)
-                .await?;
-        }
+        // Issue #290: the per-(tenant, app, deployment_id) triple key
+        // means there is no "existing instance" to stop for THIS slot
+        // — a sibling canary lives under a different deployment_id in
+        // the same map and must keep running. Legacy stop-existing
+        // semantics (which keyed by (tenant, app) only) are owned by
+        // compute_app_diff's stop_then_start diff arm; start_app now
+        // only inserts into its own triple-key slot.
 
         // Acquire an HTTP port. Issue #641: acquire() already returns
         // Option<u16>; turn None into an Err so the consume loop can
