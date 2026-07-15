@@ -287,9 +287,7 @@ pub struct AppSpec {
 /// Routes are emitted in the order the CP sent them. Canary weights
 /// arrive in the same order, so this function preserves the
 /// ingress-side weight render order without resorting.
-pub fn expand_routes(
-    apps: HashMap<String, AppSpec>,
-) -> Vec<(String, String, AppSpec)> {
+pub fn expand_routes(apps: HashMap<String, AppSpec>) -> Vec<(String, String, AppSpec)> {
     let mut out = Vec::new();
     for (app_name, spec) in apps {
         match spec.routes.clone() {
@@ -1589,10 +1587,7 @@ mod tests {
     #[test]
     fn expand_routes_single_deployment_passthrough() {
         let mut apps = HashMap::new();
-        apps.insert(
-            "myapp".to_string(),
-            make_legacy_spec("d_1", "hash-for-d1"),
-        );
+        apps.insert("myapp".to_string(), make_legacy_spec("d_1", "hash-for-d1"));
         let out = expand_routes(apps);
         assert_eq!(out.len(), 1, "legacy single-deployment must yield 1 tuple");
         let (app_name, deployment_id, spec) = &out[0];
@@ -1680,10 +1675,7 @@ mod tests {
     #[test]
     fn expand_routes_empty_routes_yields_no_tuples() {
         let mut apps = HashMap::new();
-        apps.insert(
-            "myapp".to_string(),
-            make_canary_spec("d_1", "h1", vec![]),
-        );
+        apps.insert("myapp".to_string(), make_canary_spec("d_1", "h1", vec![]));
         let out = expand_routes(apps);
         assert!(out.is_empty(), "empty routes array must not yield tuples");
     }

@@ -426,7 +426,14 @@ async fn test_app_lifecycle() {
         .expect("handle_task_message");
 
     // Step 5: app should be removed from state
-    let gone = wait_for_app_gone(&harness.supervisor, "t_test", "test-app", "d_deploy_001", 10).await;
+    let gone = wait_for_app_gone(
+        &harness.supervisor,
+        "t_test",
+        "test-app",
+        "d_deploy_001",
+        10,
+    )
+    .await;
     assert!(gone, "app should be removed from state after stop");
 }
 
@@ -661,7 +668,8 @@ async fn test_artifact_hash_match_starts_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "hash-match-app", "d_hash_match", 10).await;
+    let running =
+        wait_for_app_running(&harness.supervisor, "hash-match-app", "d_hash_match", 10).await;
     assert!(running, "matching-hash app should reach Running within 10s");
 }
 
@@ -720,9 +728,11 @@ async fn test_artifact_hash_mismatch_rejects_app() {
     {
         let state = harness.supervisor.state.read().await;
         assert!(
-            !state
-                .apps
-                .contains_key(&("t_test".to_string(), "bad-hash-app".to_string(), "d1".to_string())),
+            !state.apps.contains_key(&(
+                "t_test".to_string(),
+                "bad-hash-app".to_string(),
+                "d1".to_string()
+            )),
             "tampered-hash app must NOT be registered"
         );
     }
@@ -755,7 +765,8 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "good-hash-app", "d_hash_good", 10).await;
+    let running =
+        wait_for_app_running(&harness.supervisor, "good-hash-app", "d_hash_good", 10).await;
     assert!(
         running,
         "matching-hash app should reach Running within 10s — proves port was released after the failed start"
@@ -823,7 +834,13 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "cache-redownload-app", "d_cache_redownload", 10).await;
+    let running = wait_for_app_running(
+        &harness.supervisor,
+        "cache-redownload-app",
+        "d_cache_redownload",
+        10,
+    )
+    .await;
     assert!(
         running,
         "app should reach Running within 10s — proves the worker tolerated the bad cache and re-downloaded"
@@ -895,9 +912,11 @@ async fn test_cached_tampered_artifact_does_not_start_app_if_redownload_also_mis
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state
-            .apps
-            .contains_key(&("t_test".to_string(), "cache-dbl-bad-app".to_string(), "d1".to_string())),
+        !state.apps.contains_key(&(
+            "t_test".to_string(),
+            "cache-dbl-bad-app".to_string(),
+            "d1".to_string()
+        )),
         "app must NOT be registered when both cache and fresh download fail verification"
     );
     drop(state);
@@ -950,9 +969,11 @@ async fn test_artifact_download_returns_500_does_not_register_app() {
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state
-            .apps
-            .contains_key(&("t_test".to_string(), "download-500-app".to_string(), "d1".to_string())),
+        !state.apps.contains_key(&(
+            "t_test".to_string(),
+            "download-500-app".to_string(),
+            "d1".to_string()
+        )),
         "app must NOT be registered when the control plane returns 500"
     );
     drop(state);
@@ -1521,7 +1542,8 @@ async fn test_emit_log_reaches_ingest_within_5s() {
     // Wait until the app is Running so the forwarder has a live
     // AppLogContext for it. Once it is, any record we push with
     // that context will produce a POST to /api/internal/logs.
-    let running = wait_for_app_running(&harness.supervisor, "log-emit-sla", "d_log_emit_sla", 10).await;
+    let running =
+        wait_for_app_running(&harness.supervisor, "log-emit-sla", "d_log_emit_sla", 10).await;
     assert!(running, "app should reach Running within 10s");
 
     // Wall-clock measurement: the SLA is from `push()` to the
@@ -2060,7 +2082,8 @@ async fn test_artifact_signature_match_starts_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "sig-match-app", "d_sig_match", 10).await;
+    let running =
+        wait_for_app_running(&harness.supervisor, "sig-match-app", "d_sig_match", 10).await;
     assert!(
         running,
         "valid-signature app should reach Running within 10s"
@@ -2120,9 +2143,11 @@ async fn test_artifact_signature_mismatch_rejects_app() {
     // The bad-sig app must NOT be registered.
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state
-            .apps
-            .contains_key(&("t_test".to_string(), "sig-bad-app".to_string(), "d1".to_string())),
+        !state.apps.contains_key(&(
+            "t_test".to_string(),
+            "sig-bad-app".to_string(),
+            "d1".to_string()
+        )),
         "wrong-signature app must NOT be registered"
     );
 }
@@ -2221,9 +2246,11 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
     harness.supervisor.handle_task_message(msg2).await.ok();
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state
-            .apps
-            .contains_key(&("t_test".to_string(), "sig-cache-app".to_string(), "d1".to_string())),
+        !state.apps.contains_key(&(
+            "t_test".to_string(),
+            "sig-cache-app".to_string(),
+            "d1".to_string()
+        )),
         "tampered-sig app on cache hit must NOT be re-registered"
     );
 }
@@ -2285,9 +2312,11 @@ async fn test_artifact_signature_replay_across_deployment_ids() {
 
     let state = harness.supervisor.state.read().await;
     assert!(
-        !state
-            .apps
-            .contains_key(&("t_test".to_string(), "replay-app".to_string(), "d1".to_string())),
+        !state.apps.contains_key(&(
+            "t_test".to_string(),
+            "replay-app".to_string(),
+            "d1".to_string()
+        )),
         "replay across deployment_ids must NOT register the app"
     );
 }
@@ -2354,9 +2383,11 @@ async fn test_artifact_missing_signature_rejects_when_required() {
 
     let state = supervisor.state.read().await;
     assert!(
-        !state
-            .apps
-            .contains_key(&("t_test".to_string(), "no-sig-app".to_string(), "d1".to_string())),
+        !state.apps.contains_key(&(
+            "t_test".to_string(),
+            "no-sig-app".to_string(),
+            "d1".to_string()
+        )),
         "no-signature app with require_signature=true must NOT be registered"
     );
 
@@ -2472,15 +2503,19 @@ async fn test_canary_two_deployments_concurrently_running() {
         state.apps.keys().collect::<Vec<_>>()
     );
     assert!(
-        state
-            .apps
-            .contains_key(&("t_test".to_string(), "canary-app".to_string(), "d_canary_v1".to_string())),
+        state.apps.contains_key(&(
+            "t_test".to_string(),
+            "canary-app".to_string(),
+            "d_canary_v1".to_string()
+        )),
         "state must contain (t_test, canary-app, d_canary_v1)"
     );
     assert!(
-        state
-            .apps
-            .contains_key(&("t_test".to_string(), "canary-app".to_string(), "d_canary_v2".to_string())),
+        state.apps.contains_key(&(
+            "t_test".to_string(),
+            "canary-app".to_string(),
+            "d_canary_v2".to_string()
+        )),
         "state must contain (t_test, canary-app, d_canary_v2)"
     );
 
@@ -2550,7 +2585,14 @@ async fn test_canary_two_deployments_concurrently_running() {
         .expect("handle_task_message retirement");
 
     assert!(
-        wait_for_app_gone(&harness.supervisor, "t_test", "canary-app", "d_canary_v2", 15).await,
+        wait_for_app_gone(
+            &harness.supervisor,
+            "t_test",
+            "canary-app",
+            "d_canary_v2",
+            15
+        )
+        .await,
         "d_canary_v2 must be gone after canary retirement"
     );
     // v1 keeps running.

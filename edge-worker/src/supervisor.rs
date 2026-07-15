@@ -17,8 +17,8 @@ use crate::dispatch::{try_load_tls_config, HandlerConfig, HandlerDispatch};
 use crate::downloader::Downloader;
 use crate::log_forwarder::LogForwarder;
 use crate::messages::{
-    expand_routes, AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind,
-    MetricSample, PurgeReason, TaskMessage,
+    expand_routes, AppSpec, AppStatus, ClusterHeadroom, HeartbeatMessage, MetricKind, MetricSample,
+    PurgeReason, TaskMessage,
 };
 use crate::metering_dedupe::dedupe_id;
 use crate::metrics::{MetricsHandle, WorkerMetrics};
@@ -478,18 +478,12 @@ mod heartbeat_integration_tests {
             .write()
             .await
             .apps
-            .insert(
-                ("t_test".into(), "my-app".into(), "d1".into()),
-                app_d1,
-            );
+            .insert(("t_test".into(), "my-app".into(), "d1".into()), app_d1);
         state
             .write()
             .await
             .apps
-            .insert(
-                ("t_test".into(), "my-app".into(), "d2".into()),
-                app_d2,
-            );
+            .insert(("t_test".into(), "my-app".into(), "d2".into()), app_d2);
         let sup = build_supervisor(state);
         let hb = sup.build_heartbeat().await;
         assert_eq!(
@@ -762,12 +756,11 @@ mod heartbeat_integration_tests {
         sup.handle_task_message(msg).await.unwrap();
         // app-b must survive a per-app purge.
         assert_eq!(sup.state.read().await.apps.len(), 1);
-        assert!(sup
-            .state
-            .read()
-            .await
-            .apps
-            .contains_key(&("t_test".into(), "app-b".into(), "d1".into())));
+        assert!(sup.state.read().await.apps.contains_key(&(
+            "t_test".into(),
+            "app-b".into(),
+            "d1".into()
+        )));
     }
 
     #[tokio::test]
@@ -1408,11 +1401,10 @@ mod heartbeat_integration_tests {
             last_error: None,
         }));
 
-        state
-            .write()
-            .await
-            .apps
-            .insert(("t_test".into(), "panic-app".into(), "d_panic".into()), panic_app);
+        state.write().await.apps.insert(
+            ("t_test".into(), "panic-app".into(), "d_panic".into()),
+            panic_app,
+        );
         state.write().await.apps.insert(
             ("t_test".into(), "survivor-app".into(), "d_survivor".into()),
             survivor_app.clone(),
@@ -1440,9 +1432,11 @@ mod heartbeat_integration_tests {
             "panic-app should be removed after stop_app"
         );
         assert!(
-            snapshot
-                .apps
-                .contains_key(&("t_test".into(), "survivor-app".into(), "d_survivor".into())),
+            snapshot.apps.contains_key(&(
+                "t_test".into(),
+                "survivor-app".into(),
+                "d_survivor".into()
+            )),
             "survivor-app must remain running — supervisor must not tear down unrelated apps"
         );
         let survivor_inst = snapshot
@@ -2162,7 +2156,8 @@ impl Supervisor {
                 .map(|(_, _, d)| d.clone())
         };
         if let Some(prev_deployment_id) = existing_deployment_id {
-            self.stop_app(tenant_id, app_name, &prev_deployment_id).await?;
+            self.stop_app(tenant_id, app_name, &prev_deployment_id)
+                .await?;
         }
 
         // Acquire an HTTP port. Issue #641: acquire() already returns
@@ -2861,7 +2856,11 @@ impl Supervisor {
         app_name: &str,
         deployment_id: &str,
     ) -> anyhow::Result<()> {
-        let key = (tenant_id.to_string(), app_name.to_string(), deployment_id.to_string());
+        let key = (
+            tenant_id.to_string(),
+            app_name.to_string(),
+            deployment_id.to_string(),
+        );
         // Clone the Arc so we can lock it while the instance is still in the map.
         let instance = {
             let state = self.state.read().await;
@@ -3861,14 +3860,8 @@ impl Supervisor {
 
     /// Stop all running apps (used during graceful shutdown).
     pub async fn stop_all_apps(&self) {
-        let keys: Vec<(String, String, String)> = self
-            .state
-            .read()
-            .await
-            .apps
-            .keys()
-            .cloned()
-            .collect();
+        let keys: Vec<(String, String, String)> =
+            self.state.read().await.apps.keys().cloned().collect();
         for (tenant_id, app_name, deployment_id) in &keys {
             if let Err(e) = self.stop_app(tenant_id, app_name, deployment_id).await {
                 tracing::error!(
@@ -4042,25 +4035,15 @@ pub fn compute_app_diff(
 
     // Stop pass: every current (app, dep) NOT in the desired set.
     for (app_name, deployment_id, _) in current_apps {
-        if !desired_pairs.contains_key(&(
-            app_name.as_str(),
-            deployment_id.as_str(),
-        )) {
+        if !desired_pairs.contains_key(&(app_name.as_str(), deployment_id.as_str())) {
             apps_to_stop.push((app_name.clone(), deployment_id.clone()));
         }
     }
 
     // Start pass: every desired (app, dep) NOT in the current set.
     for (app_name, deployment_id, spec) in desired_specs {
-        if !current_pairs.contains_key(&(
-            app_name.as_str(),
-            deployment_id.as_str(),
-        )) {
-            apps_to_start.push((
-                app_name.clone(),
-                deployment_id.clone(),
-                spec.clone(),
-            ));
+        if !current_pairs.contains_key(&(app_name.as_str(), deployment_id.as_str())) {
+            apps_to_start.push((app_name.clone(), deployment_id.clone(), spec.clone()));
         }
     }
 
@@ -4167,11 +4150,7 @@ mod tests {
         deployment_id: &str,
         status: AppInstanceStatus,
     ) -> (String, String, AppInstanceStatus) {
-        (
-            app_name.to_string(),
-            deployment_id.to_string(),
-            status,
-        )
+        (app_name.to_string(), deployment_id.to_string(), status)
     }
 
     fn running(deployment_id: &str) -> (String, String, AppInstanceStatus) {
@@ -4466,10 +4445,7 @@ mod tests {
     /// running. This is the symmetric "remove canary" path.
     #[test]
     fn diff_canary_clear_stops_canary_only() {
-        let current: Vec<(String, String, AppInstanceStatus)> = vec![
-            running("d1"),
-            running("d2"),
-        ];
+        let current: Vec<(String, String, AppInstanceStatus)> = vec![running("d1"), running("d2")];
         let desired: Vec<(String, String, AppSpec)> =
             vec![("api".to_string(), "d1".to_string(), make_spec("d1"))];
 
@@ -4525,8 +4501,11 @@ mod tests {
         assert_eq!(diff.apps_to_stop.len(), 1);
         assert_eq!(diff.apps_to_stop[0], ("api".to_string(), "d1".to_string()));
         assert_eq!(diff.apps_to_start.len(), 2);
-        let mut started: Vec<String> =
-            diff.apps_to_start.iter().map(|(_, d, _)| d.clone()).collect();
+        let mut started: Vec<String> = diff
+            .apps_to_start
+            .iter()
+            .map(|(_, d, _)| d.clone())
+            .collect();
         started.sort();
         assert_eq!(started, vec!["d2".to_string(), "d3".to_string()]);
     }
@@ -4790,7 +4769,11 @@ mod tests {
                 .read()
                 .await
                 .apps
-                .get(&("test-tenant".to_string(), "app-a".to_string(), "d1".to_string()))
+                .get(&(
+                    "test-tenant".to_string(),
+                    "app-a".to_string(),
+                    "d1".to_string()
+                ))
                 .unwrap()
                 .lock()
                 .await
@@ -4819,7 +4802,11 @@ mod tests {
                 .read()
                 .await
                 .apps
-                .get(&("test-tenant".to_string(), "app-a".to_string(), "d1".to_string()))
+                .get(&(
+                    "test-tenant".to_string(),
+                    "app-a".to_string(),
+                    "d1".to_string()
+                ))
                 .unwrap()
                 .lock()
                 .await
