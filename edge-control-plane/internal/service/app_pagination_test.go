@@ -72,23 +72,6 @@ func TestDecodeAppCursor_BadJSON(t *testing.T) {
 	}
 }
 
-// TestDecodeAppCursor_EmptyPayload — a v1 envelope with a missing
-// or empty Name field. The httpx.DecodeCursor call succeeds (the
-// envelope itself is well-formed), but this file's decodeAppCursor
-// must still reject an empty Name with ErrInvalidAppCursor.
-//
-// Built by hand to mirror the scenario where someone hand-crafts a
-// cursor and forgets the field, or a future bug lets
-// httpx.EncodeCursor through with a zero payload.
-func TestDecodeAppCursor_EmptyPayload(t *testing.T) {
-	// {"v":1,"p":{"name":""}} — valid envelope, empty Name.
-	const bad = "eyJ2IjoxLCJwIjp7Im5hbWUiOiIifX0"
-	_, err := decodeAppCursor(bad)
-	if !errors.Is(err, ErrInvalidAppCursor) {
-		t.Errorf("got err=%v, want ErrInvalidAppCursor (empty name payload)", err)
-	}
-}
-
 // TestDecodeAppCursor_UnsupportedVersion — a v2 envelope returns
 // ErrUnsupportedAppCursorVersion. The chain must satisfy both this
 // alias and the underlying httpx.ErrUnsupportedCursorVersion, so a

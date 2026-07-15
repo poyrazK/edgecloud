@@ -15,7 +15,7 @@
 //  1. The version field is what makes the format forward-compatible.
 //     A future v2 cursor can coexist with v1 readers: older servers
 //     return ErrUnsupportedCursorVersion (mapped to 400) instead of
-//     silently mis-decoding a newer payload.
+//     silently accepting a newer payload as if it were v1.
 //  2. Centralizing "what is invalid vs. unsupported" in one package
 //     keeps every list endpoint's handler honest about why a 400
 //     fires — a flaky parser check ("zero ts?" "negative id?")

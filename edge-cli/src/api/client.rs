@@ -1244,8 +1244,7 @@ impl ApiClient {
                 ),
                 None => format!("{}/api/v1/apps?limit={}", self.base_url, page_size),
             };
-            let resp: AppListResponse =
-                self.get_json_anyhow("list apps", |_| url.clone())?;
+            let resp: AppListResponse = self.get_json_anyhow("list apps", |_| url.clone())?;
             all.extend(resp.apps);
             match resp.next_cursor {
                 Some(c) if !c.is_empty() => cursor = Some(c),
