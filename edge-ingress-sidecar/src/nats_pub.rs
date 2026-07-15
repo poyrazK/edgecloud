@@ -173,6 +173,20 @@ impl NatsPublisher {
             .context("publish delta")?;
         Ok(())
     }
+
+    /// Flush the underlying client's outbound buffer so any queued
+    /// `publish_delta` calls actually reach the server. Test-only
+    /// helper — production callers stay fire-and-forget because the
+    /// 1s scrape cadence gives the connection ample time to drain
+    /// naturally. async-nats 0.49.1 batches writes via `poll_flush`
+    /// on its own schedule; in a test where we publish-then-poll,
+    /// the bytes can still be sitting in the outbound buffer when
+    /// the consumer's `LastPerSubject` query fires, so the server
+    /// has nothing to deliver. Calling `flush()` forces the bytes
+    /// onto the wire before the test polls the aggregator.
+    pub async fn flush(&self) -> anyhow::Result<()> {
+        self.client.flush().await.map_err(nats_err).context("flush")
+    }
 }
 
 /// Spawn the publisher task. It owns the receiver end of the
