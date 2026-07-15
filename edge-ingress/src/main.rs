@@ -9,6 +9,7 @@
 mod caddy;
 mod config;
 mod domains;
+mod global_rps;
 pub mod heartbeats;
 mod ingress_metrics;
 pub mod l4;

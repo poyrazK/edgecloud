@@ -194,7 +194,7 @@ jobs:
         run: |
           cargo nextest run \
             --no-fail-fast \
-            -E 'kind(test) & (package(edge-worker) | package(edge-ingress))'
+            -E 'kind(test) & (package(edge-worker) | package(edge-ingress) | package(edge-ingress-sidecar))'
 
   # ============================================================
   # RUST-JS-BUILD — Issue #423: exercise `edge build --lang=js`

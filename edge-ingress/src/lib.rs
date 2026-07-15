@@ -11,6 +11,7 @@
 pub mod caddy;
 pub mod config;
 pub mod domains;
+pub mod global_rps;
 pub mod heartbeats;
 pub mod l4;
 pub mod l4_cache;
