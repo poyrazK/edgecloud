@@ -532,15 +532,18 @@ func firstDeployNewTenant(t *testing.T, serverURL string) (string, string) {
 	resp, err := http.Post(serverURL+"/api/v1/tenants",
 		"application/json", bytes.NewReader(body))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	rawBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	require.NoError(t, err, "read bootstrap response body")
 	require.Equal(t, http.StatusCreated, resp.StatusCode,
-		"Bootstrap must 201; body=%s", readBody(resp.Body))
+		"Bootstrap must 201; body=%q headers=%v", string(rawBody), resp.Header)
 
 	var out struct {
 		TenantID string `json:"tenant_id"`
 		APIKey   string `json:"api_key"`
 	}
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.NoError(t, json.Unmarshal(rawBody, &out),
+		"decode Bootstrap response; raw=%q", string(rawBody))
 	require.NotEmpty(t, out.TenantID, "BootstrapResponse missing tenant_id")
 	require.NotEmpty(t, out.APIKey, "BootstrapResponse missing api_key")
 	return out.TenantID, out.APIKey
