@@ -5,38 +5,26 @@ edition = "2021"
 rust-version = "1.85"
 publish = false
 
-# `cargo-udeps` flags every dep as "unused" until a call site appears
-# in the source tree. Schema is nested (see CLAUDE.md "Cargo udeps
-# ignore-list schema"): `normal` covers `[dependencies]`, `development`
-# covers `[dev-dependencies]`. Update this list as each PR adds deps —
-# the goal is to delete entries once every dep has a real call site.
+# `cargo-udeps` flags every dep as "unused" until PR B wires them — the
+# skeleton placeholder modules only carry `#![allow(dead_code)]` stubs.
+# Schema is nested (see CLAUDE.md "Cargo udeps ignore-list schema"):
+# `normal` covers `[dependencies]`, `development` covers `[dev-dependencies]`.
+# Update this list as PRs B/C/D/E land — the goal is to delete entries
+# once each dep has a real call site.
 [package.metadata.cargo-udeps.ignore]
 # PR B is the data plane: it ships publisher + consumer + UDS writer +
 # aggregator + caddy scraper. Every prod dep below has a real call
-# site in the sidecar's main pipeline.
+# site in the sidecar's main pipeline. `edge-test-helpers` was wired
+# by PR B for the planned testcontainers integration test, but the
+# review pushed that test to PR E — drop both the testcontainers dev-
+# deps AND the `edge-test-helpers` dev-dep now; the sidecar's
+# unit tests (in `mod tests` blocks) don't need either.
 normal = []
-# PR E adds the integration test (`tests/integration_test.rs`) which
-# uses testcontainers + testcontainers-modules to spin up a real
-# JetStream-enabled NATS container, plus `edge-test-helpers` for the
-# shared `start_nats` / `should_skip_integration_tests` helpers. The
-# cargo-udeps nightly gate cannot see those call sites — they live
-# behind a `tests/` boundary that the host scan doesn't traverse.
-development = ["testcontainers", "testcontainers-modules", "edge-test-helpers"]
+development = []
 
 [[bin]]
 name = "edge-ingress-sidecar"
 path = "src/main.rs"
-
-[lib]
-# `src/lib.rs` re-exports the same modules that `main.rs` declares so
-# the integration test (`tests/integration_test.rs`) can import them as
-# `edge_ingress_sidecar::*`. The bin crate compiles independently of
-# the lib; the modules are declared once in `lib.rs` and consumed by
-# both. Without this hatch, integration tests against a bin-only
-# crate cannot reach the internals — `cargo build --tests` succeeds
-# for unit tests inside `mod tests` but fails for `tests/*.rs`.
-name = "edge_ingress_sidecar"
-path = "src/lib.rs"
 
 [dependencies]
 # Mirrors `edge-ingress/Cargo.toml`. The sidecar exists so `edge-ingress`
@@ -65,11 +53,3 @@ tempfile = "3"
 # `unset_all_config_vars()` can stomp another's `set_var()` mid-flight,
 # producing a flaky `from_env_overrides` failure that resolves on re-run.
 serial_test = "3"
-# Integration test (`tests/integration_test.rs`, PR E) spins up a real
-# JetStream-enabled NATS container. `edge-test-helpers` provides the
-# shared `start_nats` / `should_skip_integration_tests` helpers used
-# by `edge-worker` + `edge-ingress` integration tests already, so the
-# testcontainers shape matches workspace convention.
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["nats"] }
-edge-test-helpers = { path = "../edge-test-helpers" }
