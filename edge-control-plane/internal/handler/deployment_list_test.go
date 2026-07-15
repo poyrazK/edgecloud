@@ -20,16 +20,19 @@ import (
 
 // listableStubDeploymentRepo is a focused stub for the
 // deployments-list path. It implements the deploymentRepoInterface
-// methods that are reachable from DeploymentService.List* (issue #58)
-// and panics on every other method — a deliberate tripwire if a future
-// change routes the list path through an unrelated repo method.
+// methods that are reachable from DeploymentService.ListDeploymentsPaginated
+// (issue #58, hard-cut in #709) and panics on every other method —
+// a deliberate tripwire if a future change routes the list path
+// through an unrelated repo method.
 //
 // Kept here (not in deployment_test.go) to avoid coupling the list
 // tests to the idempotency fixture scaffolding that already lives
 // there; the list tests just need a service with a repo seam.
+//
+// Issue #709 — afterID is now a text PK (`d_<uuid>`), not int64.
 type listableStubDeploymentRepo struct {
 	countByAppFn         func(ctx context.Context, tenantID, appName string) (int, error)
-	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int) ([]domain.Deployment, error)
+	listByAppPaginatedFn func(ctx context.Context, tenantID, appName string, afterTS time.Time, afterID string, limit int) ([]domain.Deployment, error)
 }
 
 func (l *listableStubDeploymentRepo) GetByID(_ context.Context, _ string) (*domain.Deployment, error) {
@@ -45,7 +48,7 @@ func (l *listableStubDeploymentRepo) CountByApp(ctx context.Context, tenantID, a
 	return 0, nil
 }
 func (l *listableStubDeploymentRepo) ListByAppPaginated(
-	ctx context.Context, tenantID, appName string, afterTS time.Time, afterID int64, limit int,
+	ctx context.Context, tenantID, appName string, afterTS time.Time, afterID string, limit int,
 ) ([]domain.Deployment, error) {
 	if l.listByAppPaginatedFn != nil {
 		return l.listByAppPaginatedFn(ctx, tenantID, appName, afterTS, afterID, limit)
@@ -89,16 +92,16 @@ func setDeploymentRepoForTest(svc *service.DeploymentService, stub *listableStub
 		Set(reflect.ValueOf(stub))
 }
 
-// TestDeploymentHandler_List_DualEnvelope_FirstPage pins the
-// first-page dual-envelope contract: both `next_cursor` and
-// `next_offset` are emitted, `total` is present, `items` is mapped
-// from the service-side rows. Issue #58 dual-envelope (compat
-// release — see #58-followup to retire next_offset).
-func TestDeploymentHandler_List_DualEnvelope_FirstPage(t *testing.T) {
+// TestDeploymentHandler_List_FirstPage_HardCut pins the post-#709
+// wire shape: no `next_offset` on any page; `next_cursor` is the
+// only pagination field. `total` is preserved because the CLI
+// renders "N deployments" in the header. `limit` is set even when
+// the query string is absent (default 20).
+func TestDeploymentHandler_List_FirstPage_HardCut(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	stub := &listableStubDeploymentRepo{
 		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 100, nil },
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return []domain.Deployment{{
 				ID: "d_first", TenantID: "t_test", AppName: "myapp", Status: "deployed",
 				Hash: "abc123", Regions: nil, CreatedAt: ts,
@@ -122,38 +125,27 @@ func TestDeploymentHandler_List_DualEnvelope_FirstPage(t *testing.T) {
 	if v, ok := resp["total"].(float64); !ok || int(v) != 100 {
 		t.Errorf("total = %v, want 100", resp["total"])
 	}
-	// limit is set even when not passed via the query string (default 20).
 	if v, ok := resp["limit"].(float64); !ok || int(v) != 20 {
 		t.Errorf("limit = %v, want 20 (default)", resp["limit"])
 	}
-	// next_cursor may or may not be present depending on the service's
-	// own emit-if-hasmore logic; we accept either here and pin the
-	// FinalPage test below for the omitempty contract.
-	// next_offset MUST be present on the first-page response.
-	if v, ok := resp["next_offset"].(float64); !ok || int(v) != 1 {
-		t.Errorf("next_offset = %v, want 1 (prevOffset 0 + len(items) 1)", resp["next_offset"])
+	// #709 — next_offset is GONE from the wire. If a regression
+	// re-introduces it, this assertion fails loudly.
+	if _, hasOff := resp["next_offset"]; hasOff {
+		t.Errorf("response has 'next_offset' on first page; #709 retired it")
 	}
-	// items must be a list of one mapped row.
 	items, ok := resp["items"].([]interface{})
 	if !ok || len(items) != 1 {
 		t.Fatalf("items = %v, want length-1 list", resp["items"])
 	}
 }
 
-// TestDeploymentHandler_List_DualEnvelope_LegacyOffset verifies the
-// legacy `?offset=N` path still works (compat release): the handler
-// must keep emitting `next_offset` so the CLI's --page math continues
-// to function against the new server.
-func TestDeploymentHandler_List_DualEnvelope_LegacyOffset(t *testing.T) {
-	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	stub := &listableStubDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 7, nil },
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
-			return []domain.Deployment{{
-				ID: "d_a", TenantID: "t_test", AppName: "myapp", CreatedAt: ts,
-			}}, nil
-		},
-	}
+// TestDeploymentHandler_List_Offset_Returns_400 pins the #709
+// hard-cut on the request side: any non-empty `?offset=` returns
+// 400 immediately. The compat release from #58 is over; stale CLI
+// invocations fail loudly instead of silently restarting the page
+// from zero.
+func TestDeploymentHandler_List_Offset_Returns_400(t *testing.T) {
+	stub := &listableStubDeploymentRepo{} // Repo MUST NOT be called.
 	mux := newDeploymentListMux(stub)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/list/myapp?offset=2&limit=3", nil)
@@ -161,29 +153,25 @@ func TestDeploymentHandler_List_DualEnvelope_LegacyOffset(t *testing.T) {
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
-	}
-	var resp map[string]interface{}
-	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	// prevOffset=2 + len(items)=1 → next_offset = 3.
-	if v, ok := resp["next_offset"].(float64); !ok || int(v) != 3 {
-		t.Errorf("next_offset = %v, want 3 (2+1)", resp["next_offset"])
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (offset retired in #709); body: %s", rr.Code, rr.Body.String())
 	}
 }
 
 // TestDeploymentHandler_List_CursorDriven_OmitsNextOffset pins the
-// asymmetric contract: when `?cursor=` is supplied, `next_offset`
-// MUST be absent because there is no well-defined offset once the
-// client has jumped forward in the cursor chain. The `?cursor=&offset=`
-// rejection lives in a sibling test below.
+// cursor-only contract: when `?cursor=` is supplied, the response
+// MUST NOT carry `next_offset` (the field is gone from the wire).
+// The cursor decodes successfully, the repo returns one row, and
+// the handler response is what we're asserting on — not whether the
+// cursor actually points at a row.
+//
+// Issue #709 — the embedded id is now a text PK, so the cursor
+// fixture is the v1 envelope `{"v":1,"p":{"ts":"...","id":"d_42"}}`.
 func TestDeploymentHandler_List_CursorDriven_OmitsNextOffset(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
 	stub := &listableStubDeploymentRepo{
 		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 7, nil },
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 			return []domain.Deployment{{
 				ID: "d_after", TenantID: "t_test", AppName: "myapp", CreatedAt: ts,
 			}}, nil
@@ -191,14 +179,9 @@ func TestDeploymentHandler_List_CursorDriven_OmitsNextOffset(t *testing.T) {
 	}
 	mux := newDeploymentListMux(stub)
 
-	// Encode a cursor via the service-layer codec directly — the
-	// service will reject text-PK ids (mustParseDeploymentID returns 0
-	// for `d_` prefixed rows), so the test uses a synthetic int64 id
-	// that won't match a real row but will round-trip through the codec.
-	// The decode succeeds, the repo returns one row, and the handler
-	// response is what we're asserting on — not whether the cursor
-	// actually points at a row.
-	cursor := "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6NDJ9fQ"
+	// {"v":1,"p":{"ts":"2026-07-15T12:34:56Z","id":"d_42"}} — base64url
+	// (RawURLEncoding, no padding).
+	cursor := "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0"
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/list/myapp?cursor="+cursor, nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
@@ -213,7 +196,7 @@ func TestDeploymentHandler_List_CursorDriven_OmitsNextOffset(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if _, hasOff := resp["next_offset"]; hasOff {
-		t.Errorf("response has 'next_offset' on cursor-driven page; want omitted")
+		t.Errorf("response has 'next_offset' on cursor-driven page; #709 retired it from the wire")
 	}
 }
 
@@ -236,28 +219,6 @@ func TestDeploymentHandler_List_BadCursor_400(t *testing.T) {
 	}
 }
 
-// TestDeploymentHandler_List_RejectsCursorAndOffset_400 — passing
-// both `?cursor=` and `?offset=` together is rejected before either
-// reaches the service. Mirrors handler/webhook.go:179-185 and
-// handler/app.go (issue #58 commit 4).
-func TestDeploymentHandler_List_RejectsCursorAndOffset_400(t *testing.T) {
-	stub := &listableStubDeploymentRepo{}
-	mux := newDeploymentListMux(stub)
-
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/list/myapp?cursor=eyJ2Ijox&offset=2", nil)
-	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
-	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body: %s", rr.Code, rr.Body.String())
-	}
-	// Service must not have been called — the route handler short-circuits.
-	// Implicit assertion: any panic from the stub would surface as a 500 with
-	// a connection-reset on the test side, which the test framework would
-	// report as a failure. Just asserting the 400 here is sufficient.
-}
-
 // TestDeploymentHandler_List_LimitClampedAt100 verifies the upper
 // clamp: requesting limit=999 yields an effective limit=100 on the
 // wire. Mirrors the apps handler's clamp test in issue #58 commit 4.
@@ -265,7 +226,7 @@ func TestDeploymentHandler_List_LimitClampedAt100(t *testing.T) {
 	var seenLimit int
 	stub := &listableStubDeploymentRepo{
 		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 0, nil },
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ int64, limit int) ([]domain.Deployment, error) {
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, limit int) ([]domain.Deployment, error) {
 			seenLimit = limit
 			return nil, nil
 		},
@@ -290,5 +251,44 @@ func TestDeploymentHandler_List_LimitClampedAt100(t *testing.T) {
 	}
 	if v, ok := resp["limit"].(float64); !ok || int(v) != 100 {
 		t.Errorf("response limit = %v, want 100 (clamped)", resp["limit"])
+	}
+}
+
+// TestDeploymentHandler_List_CursorWithLimit_200 — combining
+// `?cursor=` and `?limit=` is allowed post-#709; only `?offset=`
+// is rejected. This pins the cursor chain still works alongside
+// the explicit limit override.
+func TestDeploymentHandler_List_CursorWithLimit_200(t *testing.T) {
+	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	stub := &listableStubDeploymentRepo{
+		countByAppFn: func(_ context.Context, _, _ string) (int, error) { return 3, nil },
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
+			return []domain.Deployment{{
+				ID: "d_after", TenantID: "t_test", AppName: "myapp", CreatedAt: ts,
+			}}, nil
+		},
+	}
+	mux := newDeploymentListMux(stub)
+
+	// Same cursor fixture as the sibling cursor-driven test.
+	cursor := "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0"
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/list/myapp?cursor="+cursor+"&limit=5", nil)
+	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v, ok := resp["limit"].(float64); !ok || int(v) != 5 {
+		t.Errorf("limit = %v, want 5 (caller override)", resp["limit"])
+	}
+	if _, hasOff := resp["next_offset"]; hasOff {
+		t.Errorf("response has 'next_offset'; #709 retired it")
 	}
 }

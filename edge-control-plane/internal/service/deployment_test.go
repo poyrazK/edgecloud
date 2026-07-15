@@ -1083,52 +1083,15 @@ func TestListDeploymentsPaginated_TextPKCursorRoundTrips(t *testing.T) {
 	}
 }
 
-// TestListDeploymentsPaginatedWithTotal verifies the dual-envelope
-// path: total is read from CountByApp and NextOffset is set to
-// prevOffset+len(Items) ONLY on first-page requests.
-func TestListDeploymentsPaginatedWithTotal(t *testing.T) {
+// TestListDeploymentsPaginated_TotalEveryPage pins #709's
+// behavior: the dual-envelope compat release is retired —
+// `total` is filled in on EVERY page (including cursor-driven
+// pages) so the CLI's "Showing N deployments" header remains
+// accurate even after the user has walked several pages deep.
+func TestListDeploymentsPaginated_TotalEveryPage(t *testing.T) {
 	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	repo := &mockDeployDeploymentRepo{
-		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
-			return 42, nil
-		},
-		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
-			// Return exactly `limit` rows so NextCursor stays nil
-			// and the only assertions are on Total + NextOffset.
-			return []domain.Deployment{
-				{ID: "d_1", TenantID: "t_test", AppName: "myapp", CreatedAt: ts},
-			}, nil
-		},
-	}
-	svc := &DeploymentService{deploymentRepo: repo,
-		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
-	}
-	page, err := svc.ListDeploymentsPaginatedWithTotal(context.Background(), "t_test", "myapp", 20, "", 0)
-	if err != nil {
-		t.Fatalf("ListDeploymentsPaginatedWithTotal: %v", err)
-	}
-	if page.Total != 42 {
-		t.Errorf("page.Total = %d, want 42", page.Total)
-	}
-	if len(page.Items) != 1 {
-		t.Errorf("len(page.Items) = %d, want 1", len(page.Items))
-	}
-	if page.NextOffset == nil {
-		t.Fatal("page.NextOffset = nil, want prevOffset+len(Items) = 1")
-	}
-	if *page.NextOffset != 1 {
-		t.Errorf("page.NextOffset = %d, want 1 (0+1)", *page.NextOffset)
-	}
-}
-
-// TestListDeploymentsPaginatedWithTotal_CursorDriven_OmitsOffset
-// verifies the cursor-driven path: NextOffset MUST be nil so the
-// CLI's --page math doesn't pick a stale offset out of the chain.
-func TestListDeploymentsPaginatedWithTotal_CursorDriven_OmitsOffset(t *testing.T) {
-	ts := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
-	wantTS := ts
 	const wantID = "d_42"
-	cursor, err := encodeDeploymentCursor(wantTS, wantID)
+	cursor, err := encodeDeploymentCursor(ts, wantID)
 	if err != nil {
 		t.Fatalf("encodeDeploymentCursor: %v", err)
 	}
@@ -1143,16 +1106,46 @@ func TestListDeploymentsPaginatedWithTotal_CursorDriven_OmitsOffset(t *testing.T
 	svc := &DeploymentService{deploymentRepo: repo,
 		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
 	}
-	// pass prevOffset=999 to assert it is ignored on the cursor path.
-	page, err := svc.ListDeploymentsPaginatedWithTotal(context.Background(), "t_test", "myapp", 20, cursor, 999)
+	page, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 20, cursor)
 	if err != nil {
-		t.Fatalf("ListDeploymentsPaginatedWithTotal: %v", err)
+		t.Fatalf("ListDeploymentsPaginated: %v", err)
 	}
 	if page.Total != 7 {
-		t.Errorf("page.Total = %d, want 7", page.Total)
+		t.Errorf("page.Total = %d, want 7 (Total is filled on cursor-driven pages too)", page.Total)
 	}
-	if page.NextOffset != nil {
-		t.Errorf("page.NextOffset = %v, want nil (cursor-driven pages must omit it)", *page.NextOffset)
+	if len(page.Items) != 1 {
+		t.Errorf("len(page.Items) = %d, want 1", len(page.Items))
+	}
+}
+
+// TestListDeploymentsPaginated_NoNextOffsetField pins the #709
+// hard-cut wire shape: DeploymentListPage has no NextOffset field.
+// If this test compiles, the field is gone; if a future change
+// re-introduces it the build will fail at the struct literal
+// below.
+func TestListDeploymentsPaginated_NoNextOffsetField(t *testing.T) {
+	repo := &mockDeployDeploymentRepo{
+		countByAppFn: func(_ context.Context, _, _ string) (int, error) {
+			return 0, nil
+		},
+		listByAppPaginatedFn: func(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
+			return nil, nil
+		},
+	}
+	svc := &DeploymentService{deploymentRepo: repo,
+		memoryQuotaRepo: mockDeployMemoryQuotaFactory(),
+	}
+	page, err := svc.ListDeploymentsPaginated(context.Background(), "t_test", "myapp", 20, "")
+	if err != nil {
+		t.Fatalf("ListDeploymentsPaginated: %v", err)
+	}
+	// Struct literal enumerates the post-#709 fields. Adding
+	// NextOffset here would be a wire-shape regression.
+	_ = &DeploymentListPage{
+		Items:      page.Items,
+		Total:      page.Total,
+		Limit:      page.Limit,
+		NextCursor: page.NextCursor,
 	}
 }
 

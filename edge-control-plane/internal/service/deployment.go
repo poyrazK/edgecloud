@@ -1329,10 +1329,11 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id stri
 }
 
 // DeploymentListPage is the wire shape the deployments handler
-// returns to callers. Issue #58 dual envelope — keeps `total` and
-// `next_offset` for one compat release so the CLI's --page flag
-// still works against the new server. Follow-up #58-followup will
-// retire them.
+// returns to callers. Post-#709: `?offset=` / `next_offset` are
+// retired; only `next_cursor` remains on the wire. `total` is kept
+// (the handler emits it on every response) because the deployments
+// list has a small bounded size per (tenant, app) and the field
+// costs one COUNT(*) per request.
 //
 //   - Items: page slice (newest-first by created_at, then id).
 //   - Total: COUNT(*) for the (tenant, app) — bounded by
@@ -1340,25 +1341,23 @@ func (s *DeploymentService) GetDeployment(ctx context.Context, tenantID, id stri
 //   - Limit: effective page size.
 //   - NextCursor: opaque keyset cursor for the next page; nil on
 //     the final page.
-//   - NextOffset: present ONLY on the first-page response (when
-//     afterCursor was empty). The CLI's --page math uses this.
-//     Cursor-driven pages omit it because the offset doesn't have
-//     a well-defined value once the client has jumped forward in
-//     the cursor chain.
-//
-// Issue #58 — kept for one compat release alongside next_cursor.
 type DeploymentListPage struct {
 	Items      []domain.Deployment
 	Total      int
 	Limit      int
 	NextCursor *string
-	NextOffset *int
 }
 
 // ListDeploymentsPaginated returns one page of deployments for an
 // app via keyset pagination (issue #58). afterCursor is the opaque
 // value previously returned as NextCursor; the empty string means
 // "first page".
+//
+// Issue #709 — `?offset=` / `next_offset` retired. This is the only
+// paginated path; the dual-envelope WithTotal variant from #58 is
+// folded into this method. Total is filled in unconditionally via
+// CountByApp (one extra COUNT(*) per request; deployments is bounded
+// by quota.MaxDeployments so the cost is acceptable).
 //
 // Limit clamp: 1..100. Defense in depth — the handler also clamps
 // before calling.
@@ -1403,43 +1402,24 @@ func (s *DeploymentService) ListDeploymentsPaginated(
 		cursor, err := encodeDeploymentCursor(last.CreatedAt, last.ID)
 		if err != nil {
 			// encodeDeploymentCursor only fails on a zero TS or
-			// non-positive ID — would mean the schema is broken.
-			// Caller sees 500.
+			// empty ID — would mean the schema is broken. Caller
+			// sees 500.
 			return nil, err
 		}
 		page.NextCursor = &cursor
 	}
 	page.Items = rows
-	return page, nil
-}
 
-// ListDeploymentsPaginatedWithTotal adds the dual-envelope's total
-// field (issue #58 — kept for one compat release). The first-page
-// response also carries NextOffset = (prevOffset + len(items)) so
-// the CLI's --page math keeps working; cursor-driven pages omit it
-// because there's no well-defined offset once the client has
-// jumped forward in the cursor chain.
-//
-// Caller contract: prevOffset is meaningful ONLY on first-page
-// requests (afterCursor == ""); pass 0 otherwise.
-func (s *DeploymentService) ListDeploymentsPaginatedWithTotal(
-	ctx context.Context, tenantID, appName string, limit int, afterCursor string, prevOffset int,
-) (*DeploymentListPage, error) {
-	page, err := s.ListDeploymentsPaginated(ctx, tenantID, appName, limit, afterCursor)
-	if err != nil {
-		return nil, err
-	}
+	// Total on every page (post-#709): the dual-envelope compat release
+	// is retired; next_offset is gone but total stays because the
+	// CLI's deployments table still renders "N deployments" in the
+	// header. One COUNT(*) per request; bounded by quota.MaxDeployments.
 	total, err := s.deploymentRepo.CountByApp(ctx, tenantID, appName)
 	if err != nil {
 		return nil, fmt.Errorf("counting deployments: %w", err)
 	}
 	page.Total = total
-	if afterCursor == "" {
-		// First-page path: preserve the offset arithmetic so --page
-		// continues to work. issue-58-followup retires this.
-		nextOffset := prevOffset + len(page.Items)
-		page.NextOffset = &nextOffset
-	}
+
 	return page, nil
 }
 

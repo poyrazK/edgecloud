@@ -940,7 +940,7 @@ func (f *fullStubDeploymentRepo) ListByApp(_ context.Context, _, _ string) ([]do
 func (f *fullStubDeploymentRepo) CountByApp(_ context.Context, _, _ string) (int, error) {
 	panic("fullStubDeploymentRepo.CountByApp: replay path should not reach here")
 }
-func (f *fullStubDeploymentRepo) ListByAppPaginated(_ context.Context, _, _ string, _ time.Time, _ int64, _ int) ([]domain.Deployment, error) {
+func (f *fullStubDeploymentRepo) ListByAppPaginated(_ context.Context, _, _ string, _ time.Time, _ string, _ int) ([]domain.Deployment, error) {
 	panic("fullStubDeploymentRepo.ListByAppPaginated: replay path should not reach here")
 }
 func (f *fullStubDeploymentRepo) Create(_ context.Context, _ *domain.Deployment) error {

@@ -146,11 +146,11 @@ type statusResponse struct {
 // `GET /api/v1/list/{appName}`. Mirrors the `DeploymentListResponse`
 // schema in `openapi.yaml`.
 //
-// Issue #58 dual envelope — `next_cursor` is the new keyset cursor
-// (always emitted when more pages exist); `next_offset` is kept for
-// one compat release so the existing CLI's --page math keeps working
-// against the new server. The follow-up to retire `next_offset` lives
-// in #58-followup (modeled on #682, the logs offset-retire follow-up).
+// Issue #709 hard-cut — the dual envelope from #58 is retired.
+// `?offset=` is rejected with 400. `next_offset` is gone from the
+// wire. `next_cursor` is the only pagination cursor. `total` stays
+// because the deployments list has a small bounded size per
+// (tenant, app) and the CLI renders "N deployments" in the header.
 //
 // On the wire:
 //
@@ -158,20 +158,13 @@ type statusResponse struct {
 //	  "items":         [...],
 //	  "total":         213,
 //	  "limit":         50,
-//	  "next_cursor":   "eyJ2IjoxLCJwIjp7InRzIjoi...",  // absent on final page
-//	  "next_offset":   50                              // first-page only
+//	  "next_cursor":   "eyJ2IjoxLCJwIjp7InRzIjoi..."   // absent on final page
 //	}
-//
-// Asymmetric presence: `next_offset` is set ONLY on the first-page
-// response (when `?cursor=` is empty). Once the client starts walking
-// the cursor chain there is no well-defined offset — the cursor
-// already encodes "where to continue from" — so the field is omitted.
 type deploymentListResponse struct {
 	Items      []statusResponse `json:"items"`
 	Total      int              `json:"total"`
 	Limit      int              `json:"limit"`
 	NextCursor *string          `json:"next_cursor,omitempty"`
-	NextOffset *int             `json:"next_offset,omitempty"`
 }
 
 // newStatusResponse maps a DB row to the typed wire DTO. The same
@@ -695,41 +688,35 @@ func (h *DeploymentHandler) GetStatus(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// List handles GET /api/v1/list/{appName}. Issue #58 dual envelope:
-// accepts either the new `?cursor=` (recommended) OR the legacy
-// `?offset=` (kept for one compat release — see #58-followup), but
-// never both at once.
+// List handles GET /api/v1/list/{appName}. Issue #709 hard-cut:
+// `?cursor=` is the only pagination input. `?offset=` is rejected
+// with 400 unconditionally (no compat release).
 //
 // Cursor-walk contract:
 //   - `?cursor=<opaque>` walks forward in the (created_at, id) chain
-//     emitted as `next_cursor` on the previous page. `next_offset` is
-//     NOT emitted on cursor-driven pages — there is no well-defined
-//     offset once the client has jumped forward.
-//   - `?offset=<n>` returns the page starting at row `n` (legacy).
-//     `next_offset = prevOffset + len(items)` is emitted so the CLI's
-//     --page math keeps working.
+//     emitted as `next_cursor` on the previous page. `next_cursor`
+//     is absent on the final page.
+//   - `?limit=<n>` clamps to 1..100 (defense in depth — the service
+//     also clamps). Values <=0 silently become 20 (back-compat with
+//     the pre-#58 default).
 //
-// `next_cursor` is emitted on every page (including legacy-offset
-// pages) when the page is exhausted — i.e., the server doesn't know
-// whether the legacy offset was at the boundary, so it always offers
-// the cursor chain. Callers that want deterministic cursor walks can
-// ignore `?offset=` entirely.
-//
-// Limits: 1..100. Values <=0 silently become 20 (back-compat with the
-// pre-#58 default); values >100 are clamped to 100.
+// Limits: 1..100. Values <=0 silently become 20; values >100 are
+// clamped to 100.
 func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 	tenantID := middleware.GetTenantID(r.Context())
 	appName := r.PathValue("appName")
 
-	// Issue #58 — reject cursor+offset together. Mirrors the gate at
-	// webhook.go:179-185 and logs.go:67. Mixing them is a wire bug
-	// that hides stale cursor continuations behind an offset jump.
-	cursor := r.URL.Query().Get("cursor")
-	offsetStr := r.URL.Query().Get("offset")
-	if cursor != "" && offsetStr != "" {
-		httperror.BadRequestCtx(w, r, "cursor and offset are mutually exclusive")
+	// Issue #709 — `?offset=` is retired. Any non-empty value returns
+	// 400 so a stale CLI invocation fails loudly instead of silently
+	// restarting the page from zero. Mirrors the equivalent gate
+	// landed in commit 4 of #708 for /api/v1/apps and the patterns
+	// at apps.go + webhook.go + logs.go.
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		httperror.BadRequestCtx(w, r, "offset is not supported; use cursor")
 		return
 	}
+
+	cursor := r.URL.Query().Get("cursor")
 
 	limit := 20
 	if l := r.URL.Query().Get("limit"); l != "" {
@@ -741,18 +728,7 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
-	// Offset is only honored when no cursor is supplied. Stays as a
-	// compat release surface — see issue-58-followup.
-	prevOffset := 0
-	if cursor == "" {
-		if offsetStr != "" {
-			if parsed, err := strconv.Atoi(offsetStr); err == nil && parsed >= 0 {
-				prevOffset = parsed
-			}
-		}
-	}
-
-	page, err := h.deploymentSvc.ListDeploymentsPaginatedWithTotal(r.Context(), tenantID, appName, limit, cursor, prevOffset)
+	page, err := h.deploymentSvc.ListDeploymentsPaginated(r.Context(), tenantID, appName, limit, cursor)
 	if err != nil {
 		// Map typed cursor errors to 400 with a generic message
 		// (matches webhook.go:201-206 and the apps handler added in
@@ -778,7 +754,6 @@ func (h *DeploymentHandler) List(w http.ResponseWriter, r *http.Request) {
 		Total:      page.Total,
 		Limit:      page.Limit,
 		NextCursor: page.NextCursor,
-		NextOffset: page.NextOffset,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
