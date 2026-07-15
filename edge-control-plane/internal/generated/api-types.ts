@@ -2093,7 +2093,7 @@ export interface components {
              *     Issue #58 (cursor); #709 (text-PK cursor; the `d_<uuid>`
              *     id is encoded as a JSON string and survives a server
              *     upgrade unchanged).
-             * @example eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0
+             * @example eyJ2IjoxLCJwIjp7InRzIjoiMjAzMS0wOC0yMFQwMTowMTowMVoiLCJpZCI6ImRfNTAifX0
              */
             next_cursor?: string | null;
         };

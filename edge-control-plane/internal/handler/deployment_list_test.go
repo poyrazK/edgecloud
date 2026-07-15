@@ -181,7 +181,7 @@ func TestDeploymentHandler_List_CursorDriven_OmitsNextOffset(t *testing.T) {
 
 	// {"v":1,"p":{"ts":"2026-07-15T12:34:56Z","id":"d_42"}} — base64url
 	// (RawURLEncoding, no padding).
-	cursor := "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0"
+	cursor := "eyJ2IjoxLCJwIjp7InRzIjoiMjAzMS0wOC0yMFQwMTowMTowMVoiLCJpZCI6ImRfNTAifX0"
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/list/myapp?cursor="+cursor, nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))
@@ -271,7 +271,7 @@ func TestDeploymentHandler_List_CursorWithLimit_200(t *testing.T) {
 	mux := newDeploymentListMux(stub)
 
 	// Same cursor fixture as the sibling cursor-driven test.
-	cursor := "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0"
+	cursor := "eyJ2IjoxLCJwIjp7InRzIjoiMjAzMS0wOC0yMFQwMTowMTowMVoiLCJpZCI6ImRfNTAifX0"
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/list/myapp?cursor="+cursor+"&limit=5", nil)
 	req = req.WithContext(middleware.WithTenantID(req.Context(), "t_test"))

@@ -90,8 +90,8 @@ func TestDecodeDeploymentCursor_BadJSON(t *testing.T) {
 // envelope is well-formed), but this file's decodeDeploymentCursor
 // must still reject it with ErrInvalidDeploymentCursor.
 func TestDecodeDeploymentCursor_ZeroTSInPayload(t *testing.T) {
-	// {"v":1,"p":{"ts":"0001-01-01T00:00:00Z","id":"d_42"}}
-	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpZCI6ImRfNDIifX0"
+	// {"v":1,"p":{"ts":"0001-01-01T00:00:00Z","id":"d_50"}}
+	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpZCI6ImRfNTAifX0"
 	_, _, err := decodeDeploymentCursor(bad)
 	if !errors.Is(err, ErrInvalidDeploymentCursor) {
 		t.Errorf("err = %v, want ErrInvalidDeploymentCursor (zero TS payload)", err)
@@ -103,8 +103,8 @@ func TestDecodeDeploymentCursor_ZeroTSInPayload(t *testing.T) {
 // must chain to ErrInvalidDeploymentCursor. Issue #709 — id is
 // text now, so the payload's id field is quoted in the JSON.
 func TestDecodeDeploymentCursor_EmptyIDInPayload(t *testing.T) {
-	// {"v":1,"p":{"ts":"2026-07-15T12:34:56Z","id":""}}
-	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6IiJ9fQ"
+	// {"v":1,"p":{"ts":"2031-08-20T01:01:01Z","id":""}}
+	const bad = "eyJ2IjoxLCJwIjp7InRzIjoiMjAzMS0wOC0yMFQwMTowMTowMVoiLCJpZCI6IiJ9fQ"
 	_, _, err := decodeDeploymentCursor(bad)
 	if !errors.Is(err, ErrInvalidDeploymentCursor) {
 		t.Errorf("err = %v, want ErrInvalidDeploymentCursor (empty id payload)", err)
@@ -116,8 +116,8 @@ func TestDecodeDeploymentCursor_EmptyIDInPayload(t *testing.T) {
 // satisfy both this alias and the underlying
 // httpx.ErrUnsupportedCursorVersion.
 func TestDecodeDeploymentCursor_UnsupportedVersion(t *testing.T) {
-	// {"v":2,"p":{"ts":"2026-07-15T12:34:56Z","id":"d_42"}}
-	const future = "eyJ2IjoyLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6ImRfNDIifX0"
+	// {"v":2,"p":{"ts":"2031-08-20T01:01:01Z","id":"d_50"}}
+	const future = "eyJ2IjoyLCJwIjp7InRzIjoiMjAzMS0wOC0yMFQwMTowMTowMVoiLCJpZCI6ImRfNTAifX0"
 	_, _, err := decodeDeploymentCursor(future)
 	if !errors.Is(err, ErrUnsupportedDeploymentCursorVersion) {
 		t.Errorf("err = %v, want ErrUnsupportedDeploymentCursorVersion", err)
