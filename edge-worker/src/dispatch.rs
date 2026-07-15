@@ -113,6 +113,9 @@ type HandlerResponseReceiver = tokio::sync::oneshot::Receiver<HandlerResponseRes
 struct CountingBody {
     inner: HyperOutgoingBody,
     meter: Arc<RequestMeter>,
+    /// Worker-level metrics handle (issue #49). `None` for tests
+    /// that build a synthetic dispatch without a `WorkerMetrics`.
+    metrics_handle: Option<Arc<crate::metrics::MetricsHandle>>,
 }
 
 impl Body for CountingBody {
@@ -126,7 +129,11 @@ impl Body for CountingBody {
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    self.meter.record_outbound_bytes(data.len() as u64);
+                    let len = data.len() as u64;
+                    self.meter.record_outbound_bytes(len);
+                    if let Some(handle) = self.metrics_handle.as_ref() {
+                        handle.outbound_bytes.inc_by(len);
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -292,6 +299,13 @@ pub struct HandlerConfig {
     /// into the guest env as `EDGE_PREVIEW_PR_NUMBER` so the guest
     /// can render PR-aware UI.
     pub preview_pr_number: Option<u32>,
+    /// Worker-level per-app `MetricsHandle` (issue #49). The dispatch
+    /// path bumps the same four `IntCounter`s that
+    /// `RequestMeter` already increments, so the `/metrics`
+    /// endpoint exposes per-app counters without taking a lock on
+    /// the worker-level `WorkerMetrics`. `None` for tests that build
+    /// a synthetic `HandlerConfig` without a `WorkerMetrics`.
+    pub metrics_handle: Option<Arc<crate::metrics::MetricsHandle>>,
 }
 
 impl HandlerDispatch {
@@ -587,6 +601,7 @@ pub fn check_body_cap(
     content_length: Option<u64>,
     cap: u64,
     meter: &Arc<RequestMeter>,
+    metrics_handle: Option<&Arc<crate::metrics::MetricsHandle>>,
 ) -> Option<HyperResponse<HyperOutgoingBody>> {
     if cap == 0 {
         return None;
@@ -598,7 +613,7 @@ pub fn check_body_cap(
                 cap,
                 "request body exceeds per-app cap; rejecting 413",
             );
-            Some(synthetic_413(len, cap, meter))
+            Some(synthetic_413(len, cap, meter, metrics_handle))
         }
         _ => None,
     }
@@ -761,9 +776,12 @@ impl HandlerDispatch {
                 .get(hyper::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse::<u64>().ok());
-            if let Some(resp) =
-                check_body_cap(cl, self.config.max_request_body_bytes, &self.config.meter)
-            {
+            if let Some(resp) = check_body_cap(
+                cl,
+                self.config.max_request_body_bytes,
+                &self.config.meter,
+                self.config.metrics_handle.as_ref(),
+            ) {
                 return Ok(resp);
             }
         }
@@ -855,6 +873,13 @@ impl HandlerDispatch {
         // snapshot-and-subtract in the heartbeat loop, not here, so
         // the counter only ever moves forward.
         self.config.meter.record_request();
+        // Mirror into the worker-level /metrics counter (issue #49).
+        // The IntCounter is monotonic (no snapshot-and-subtract
+        // path) — operator dashboards want a running total, not a
+        // delta since the last heartbeat.
+        if let Some(handle) = self.config.metrics_handle.as_ref() {
+            handle.requests.inc();
+        }
         // Issue #555: capture the dispatch-accept instant so the
         // terminal arm of `receiver.await` can stamp
         // `meter.record_duration(elapsed)` with the user-visible
@@ -869,6 +894,16 @@ impl HandlerDispatch {
         let started_at = std::time::Instant::now();
         let tenant_for_log = self.config.tenant_id.clone();
         let app_name_for_log = self.config.app_ctx.app_name.clone();
+        // Hoist the Option<&Arc<MetricsHandle>> once. Per finding #8
+        // (PR #697 review), the closure below previously captured
+        // `self.config.metrics_handle.as_ref()` four times across
+        // the terminal arms — a refcount bump per arm, per FaaS
+        // request. Pulling it out once at the top of handle_request
+        // cuts the four bumps to one (negligible compared to the
+        // guest trap path, but the cleanest pattern). Tests still
+        // get `None` here when `metrics_handle: None` was set on the
+        // dispatched HandlerConfig.
+        let metrics_handle = self.config.metrics_handle.as_ref();
 
         // Spawn the guest concurrently so the host can start serving
         // the response body as soon as the guest calls
@@ -893,13 +928,25 @@ impl HandlerDispatch {
         });
 
         let meter = &self.config.meter;
+        // Helper: stamp FaaS duration (issue #555) on the per-request
+        // RequestMeter AND on the worker-level IntCounter. The two
+        // counters are independent — RequestMeter is
+        // snapshot-and-subtracted by the heartbeat loop; the IntCounter
+        // is monotonic for /metrics. `metrics_handle` is None for
+        // tests that build a synthetic dispatch.
+        let stamp_duration = |elapsed: std::time::Duration| {
+            meter.record_duration(elapsed);
+            if let Some(handle) = metrics_handle {
+                handle.duration_ms.inc_by(elapsed.as_millis() as u64);
+            }
+        };
         match receiver.await {
             Ok(Ok(resp)) => {
                 // Stamp FaaS duration (issue #555). Covers the
                 // success path: guest called
                 // `response-outparam::set(Ok(resp))` and we are about
                 // to return the response to hyper.
-                meter.record_duration(started_at.elapsed());
+                stamp_duration(started_at.elapsed());
                 // Wrap the response body in CountingBody so every data
                 // frame's byte length is metered via record_outbound_bytes
                 // (fixes issue #210 — outbound byte metering was lost
@@ -908,6 +955,7 @@ impl HandlerDispatch {
                 let counting = CountingBody {
                     inner: body,
                     meter: meter.clone(),
+                    metrics_handle: metrics_handle.cloned(),
                 };
                 Ok(HyperResponse::from_parts(parts, counting.boxed_unsync()))
             }
@@ -925,10 +973,11 @@ impl HandlerDispatch {
                 // Stamp FaaS duration (issue #555). The guest did
                 // call `set` — we got a result, just an error-coded
                 // one. Duration is billable.
-                meter.record_duration(started_at.elapsed());
+                stamp_duration(started_at.elapsed());
                 Ok(synthetic_500(
                     &format!("guest returned error-code: {error_code:?}"),
                     meter,
+                    metrics_handle,
                 ))
             }
             Err(_dropped) => {
@@ -957,8 +1006,8 @@ impl HandlerDispatch {
                     // Stamp FaaS duration (issue #555). Clean
                     // process.exit is billable, consistent with
                     // `request_count` being billed for this arm.
-                    meter.record_duration(started_at.elapsed());
-                    return Ok(synthetic_500("guest cleanly exited", meter));
+                    stamp_duration(started_at.elapsed());
+                    return Ok(synthetic_500("guest cleanly exited", meter, metrics_handle));
                 }
 
                 // Real trap. guest_result has already resolved with
@@ -982,8 +1031,8 @@ impl HandlerDispatch {
                 // (epoch deadline exceeded) ARE billed — there is
                 // no grace period today; see `record_duration`'s
                 // doc-comment in edge-runtime/src/metering.rs.
-                meter.record_duration(started_at.elapsed());
-                Ok(synthetic_500(&format!("{e:#}"), meter))
+                stamp_duration(started_at.elapsed());
+                Ok(synthetic_500(&format!("{e:#}"), meter, metrics_handle))
             }
         }
     }
@@ -1061,10 +1110,13 @@ fn truncate_diagnostic(diagnostic: &str) -> &str {
 ///
 /// The synthetic body length is recorded via `meter.record_outbound_bytes`
 /// so billing reflects bytes served even on error responses (issue #210).
+/// The mirror bump into the worker-level `outbound_bytes` IntCounter
+/// (issue #49) lets `/metrics` reflect error-path bytes too.
 fn synthetic_response(
     status: hyper::StatusCode,
     diagnostic: &str,
     meter: &Arc<RequestMeter>,
+    metrics_handle: Option<&Arc<crate::metrics::MetricsHandle>>,
 ) -> HyperResponse<HyperOutgoingBody> {
     use http_body_util::{BodyExt, Full};
     use hyper::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -1075,6 +1127,9 @@ fn synthetic_response(
     let len = body.len();
 
     meter.record_outbound_bytes(len as u64);
+    if let Some(handle) = metrics_handle {
+        handle.outbound_bytes.inc_by(len as u64);
+    }
 
     let body_wrapped =
         Full::from(bytes::Bytes::from(body)).map_err(|never: Infallible| match never {});
@@ -1088,8 +1143,17 @@ fn synthetic_response(
 }
 
 /// Build a synthetic 500. See `synthetic_response`.
-fn synthetic_500(diagnostic: &str, meter: &Arc<RequestMeter>) -> HyperResponse<HyperOutgoingBody> {
-    synthetic_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, diagnostic, meter)
+fn synthetic_500(
+    diagnostic: &str,
+    meter: &Arc<RequestMeter>,
+    metrics_handle: Option<&Arc<crate::metrics::MetricsHandle>>,
+) -> HyperResponse<HyperOutgoingBody> {
+    synthetic_response(
+        hyper::StatusCode::INTERNAL_SERVER_ERROR,
+        diagnostic,
+        meter,
+        metrics_handle,
+    )
 }
 
 /// Build a synthetic 413 Payload Too Large with a diagnostic that
@@ -1098,10 +1162,16 @@ fn synthetic_413(
     content_length: u64,
     cap: u64,
     meter: &Arc<RequestMeter>,
+    metrics_handle: Option<&Arc<crate::metrics::MetricsHandle>>,
 ) -> HyperResponse<HyperOutgoingBody> {
     let diagnostic =
         format!("request body of {content_length} bytes exceeds per-app cap of {cap} bytes");
-    synthetic_response(hyper::StatusCode::PAYLOAD_TOO_LARGE, &diagnostic, meter)
+    synthetic_response(
+        hyper::StatusCode::PAYLOAD_TOO_LARGE,
+        &diagnostic,
+        meter,
+        metrics_handle,
+    )
 }
 
 // ── InFlightGuard tests ─────────────────────────────────────────────────
@@ -1269,14 +1339,14 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_500_returns_internal_server_error() {
         let m = test_meter();
-        let resp = synthetic_500("something went wrong", &m);
+        let resp = synthetic_500("something went wrong", &m, None);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn synthetic_500_has_text_content_type() {
         let m = test_meter();
-        let resp = synthetic_500("test", &m);
+        let resp = synthetic_500("test", &m, None);
         assert_eq!(
             resp.headers()
                 .get("content-type")
@@ -1290,7 +1360,7 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_500_has_content_length_header() {
         let m = test_meter();
-        let resp = synthetic_500("hello", &m);
+        let resp = synthetic_500("hello", &m, None);
         assert!(resp.headers().get("content-length").is_some());
         let cl: usize = resp
             .headers()
@@ -1306,7 +1376,7 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_500_content_length_matches_diagnostic_length() {
         let m = test_meter();
-        let resp = synthetic_500("abc", &m);
+        let resp = synthetic_500("abc", &m, None);
         let cl: usize = resp
             .headers()
             .get("content-length")
@@ -1323,7 +1393,7 @@ mod synthetic_response_tests {
     fn synthetic_500_truncates_very_long_diagnostics() {
         let m = test_meter();
         let long = "x".repeat(10_000);
-        let resp = synthetic_500(&long, &m);
+        let resp = synthetic_500(&long, &m, None);
         let cl: usize = resp
             .headers()
             .get("content-length")
@@ -1339,14 +1409,14 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_500_empty_diagnostic_returns_500() {
         let m = test_meter();
-        let resp = synthetic_500("", &m);
+        let resp = synthetic_500("", &m, None);
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
     fn synthetic_500_content_length_is_zero_for_empty() {
         let m = test_meter();
-        let resp = synthetic_500("", &m);
+        let resp = synthetic_500("", &m, None);
         let cl: usize = resp
             .headers()
             .get("content-length")
@@ -1361,14 +1431,14 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_413_returns_payload_too_large() {
         let m = test_meter();
-        let resp = synthetic_413(1_000_000, 1024, &m);
+        let resp = synthetic_413(1_000_000, 1024, &m, None);
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
     fn synthetic_413_has_text_content_type() {
         let m = test_meter();
-        let resp = synthetic_413(5000, 100, &m);
+        let resp = synthetic_413(5000, 100, &m, None);
         assert_eq!(
             resp.headers()
                 .get("content-type")
@@ -1382,14 +1452,14 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_413_has_content_length_header() {
         let m = test_meter();
-        let resp = synthetic_413(5000, 100, &m);
+        let resp = synthetic_413(5000, 100, &m, None);
         assert!(resp.headers().get("content-length").is_some());
     }
 
     #[test]
     fn synthetic_413_diagnostic_mentions_both_values() {
         let m = test_meter();
-        let resp = synthetic_413(5000, 100, &m);
+        let resp = synthetic_413(5000, 100, &m, None);
         // We can't easily read the body without consuming the response,
         // but the content-length is always > 0 for non-empty input.
         let cl: usize = resp
@@ -1409,7 +1479,7 @@ mod synthetic_response_tests {
     #[test]
     fn synthetic_413_handles_large_numbers() {
         let m = test_meter();
-        let resp = synthetic_413(u64::MAX, u64::MAX, &m);
+        let resp = synthetic_413(u64::MAX, u64::MAX, &m, None);
         let cl: usize = resp
             .headers()
             .get("content-length")
@@ -1429,32 +1499,32 @@ mod synthetic_response_tests {
     #[test]
     fn body_cap_disabled_returns_none() {
         let m = test_meter();
-        assert!(check_body_cap(Some(999_999), 0, &m).is_none());
+        assert!(check_body_cap(Some(999_999), 0, &m, None).is_none());
     }
 
     #[test]
     fn body_cap_no_content_length_returns_none() {
         let m = test_meter();
-        assert!(check_body_cap(None, 1024, &m).is_none());
+        assert!(check_body_cap(None, 1024, &m, None).is_none());
     }
 
     #[test]
     fn body_cap_within_limit_returns_none() {
         let m = test_meter();
-        assert!(check_body_cap(Some(100), 1024, &m).is_none());
+        assert!(check_body_cap(Some(100), 1024, &m, None).is_none());
     }
 
     #[test]
     fn body_cap_exact_limit_returns_none() {
         let m = test_meter();
         // Content-Length exactly equal to cap should pass.
-        assert!(check_body_cap(Some(1024), 1024, &m).is_none());
+        assert!(check_body_cap(Some(1024), 1024, &m, None).is_none());
     }
 
     #[test]
     fn body_cap_exceeds_returns_413() {
         let m = test_meter();
-        let resp = check_body_cap(Some(2000), 1024, &m);
+        let resp = check_body_cap(Some(2000), 1024, &m, None);
         assert!(resp.is_some());
         assert_eq!(resp.unwrap().status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -1462,7 +1532,7 @@ mod synthetic_response_tests {
     #[test]
     fn body_cap_zero_length_returns_none() {
         let m = test_meter();
-        assert!(check_body_cap(Some(0), 1024, &m).is_none());
+        assert!(check_body_cap(Some(0), 1024, &m, None).is_none());
     }
 
     // ── truncate_diagnostic tests ───────────────────────────────────
@@ -1531,6 +1601,7 @@ mod synthetic_response_tests {
         let mut counting = CountingBody {
             inner: inner_hyper,
             meter: meter.clone(),
+            metrics_handle: None,
         };
 
         while let Some(Ok(_)) = Pin::new(&mut counting).frame().await {}
@@ -1612,6 +1683,7 @@ mod synthetic_response_tests {
         let mut counting = CountingBody {
             inner: inner_hyper,
             meter: meter.clone(),
+            metrics_handle: None,
         };
 
         while let Some(Ok(_)) = Pin::new(&mut counting).frame().await {}
@@ -1627,6 +1699,7 @@ mod synthetic_response_tests {
         let counting = CountingBody {
             inner: inner_hyper,
             meter,
+            metrics_handle: None,
         };
 
         let hint = Body::size_hint(&counting);
@@ -1647,6 +1720,7 @@ mod synthetic_response_tests {
         let mut counting = CountingBody {
             inner: inner_hyper,
             meter: meter.clone(),
+            metrics_handle: None,
         };
 
         use std::pin::Pin;
@@ -1666,6 +1740,7 @@ mod synthetic_response_tests {
         let counting = CountingBody {
             inner: inner_hyper,
             meter,
+            metrics_handle: None,
         };
         assert!(counting.is_end_stream());
     }
@@ -1675,7 +1750,7 @@ mod synthetic_response_tests {
     #[tokio::test]
     async fn synthetic_500_body_contains_diagnostic() {
         let m = test_meter();
-        let resp = synthetic_500("custom error message", &m);
+        let resp = synthetic_500("custom error message", &m, None);
         let body_bytes = resp
             .collect()
             .await
@@ -1689,7 +1764,7 @@ mod synthetic_response_tests {
     #[tokio::test]
     async fn synthetic_413_body_contains_cap_info() {
         let m = test_meter();
-        let resp = synthetic_413(10_000_000, 1024, &m);
+        let resp = synthetic_413(10_000_000, 1024, &m, None);
         let body_bytes = resp
             .collect()
             .await
@@ -1775,6 +1850,7 @@ mod synthetic_response_tests {
             // tests can override these by building a custom HandlerConfig.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -1841,6 +1917,7 @@ mod synthetic_response_tests {
             // tests can override these by building a custom HandlerConfig.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -1939,6 +2016,7 @@ mod synthetic_response_tests {
             // tests can override these by building a custom HandlerConfig.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -2001,6 +2079,7 @@ mod synthetic_response_tests {
             // tests can override these by building a custom HandlerConfig.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let dispatch = HandlerDispatch::new(
@@ -2066,6 +2145,7 @@ mod synthetic_response_tests {
             // tests can override these by building a custom HandlerConfig.
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         // epoch_tick_ms=0 → tick_ms field = 1 (verified by budget math above)

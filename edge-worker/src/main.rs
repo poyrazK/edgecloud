@@ -1,22 +1,5 @@
 //! edge-worker — Worker Supervisor entry point.
 
-mod auth;
-mod backoff;
-mod bootstrap;
-mod config;
-mod detect;
-mod dispatch;
-mod downloader;
-mod log_forwarder;
-mod messages;
-mod metering_dedupe;
-mod nats;
-mod port_pool;
-mod state;
-mod supervisor;
-mod verifier;
-mod worker_key;
-
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,18 +12,22 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+use edge_worker::auth::{
+    load_persisted_identity, persist_identity, PersistedIdentity, WorkerJwtSigner,
+};
+use edge_worker::backoff::compute_backoff_ms;
+use edge_worker::bootstrap::BootstrapClient;
+use edge_worker::config::Config;
+use edge_worker::downloader::Downloader;
+use edge_worker::log_forwarder::LogForwarder;
+use edge_worker::metrics::WorkerMetrics;
+use edge_worker::nats::{NatsClient, NatsClientImpl};
+use edge_worker::port_pool::PortPool;
+use edge_worker::state::WorkerState;
+use edge_worker::supervisor::{StandbyPool, Supervisor};
 use edge_worker::tracing_layer::WorkerLogLayer;
-
-use crate::auth::WorkerJwtSigner;
-use crate::backoff::compute_backoff_ms;
-use crate::config::Config;
-use crate::downloader::Downloader;
-use crate::log_forwarder::LogForwarder;
-use crate::nats::NatsClientImpl;
-use crate::port_pool::PortPool;
-use crate::state::WorkerState;
-use crate::supervisor::Supervisor;
-use crate::verifier::Keyring;
+use edge_worker::verifier::Keyring;
+use edge_worker::worker_key::WorkerIdentity;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     // keypair is reused across restarts so the worker's public_key
     // (and therefore its kid) stays stable; main() never generates
     // a new identity for the same on-disk path.
-    let identity = crate::worker_key::WorkerIdentity::load_or_create(&config.worker_key_path)
+    let identity = WorkerIdentity::load_or_create(&config.worker_key_path)
         .context("loading worker identity keypair")?;
 
     // Resolve the JWT secret + kid. Three paths, in priority order:
@@ -289,12 +276,19 @@ async fn main() -> anyhow::Result<()> {
             config.queue_group.clone(),
         )
         .await?,
-    ) as Arc<dyn crate::nats::NatsClient>;
+    ) as Arc<dyn NatsClient>;
     tracing::info!(url = %config.nats_url, "connected to NATS");
 
     // Create the shutdown broadcast channel for the heartbeat task.
     // Using broadcast lets us get a fresh receiver (subscription) each loop iteration.
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
+
+    // Build the WorkerMetrics surface (issue #49). Per-app
+    // MetricsHandles are registered/unregistered from
+    // Supervisor::start_app / stop_app; the supervisor stores an
+    // Arc<WorkerMetrics> so the dispatch path can `inc_by` from
+    // a cloned handle without taking a lock.
+    let worker_metrics = WorkerMetrics::new()?;
 
     // Create the supervisor
     let http = reqwest::Client::builder()
@@ -309,11 +303,37 @@ async fn main() -> anyhow::Result<()> {
         log_forwarder: log_forwarder.clone(),
         jwt_signer: jwt_signer.clone(),
         http,
-        engine_pool: Arc::new(crate::supervisor::StandbyPool::new(
-            config.standby_pool_size,
-        )?),
+        engine_pool: Arc::new(StandbyPool::new(config.standby_pool_size)?),
         port_pool_exhausted_events: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics: worker_metrics.clone(),
     });
+
+    // Issue #49: spawn the Prometheus /metrics HTTP server. Bearer
+    // auth via `METRICS_AUTH_TOKEN`; empty token → every request gets
+    // 401 (fail-closed). Shutdown piggy-backs on the same broadcast
+    // the heartbeat + log forwarder observe.
+    //
+    // The token is wrapped in `Arc<str>` once at startup so the per-
+    // connection spawn inside `serve_inner` does a refcount bump
+    // instead of allocating a fresh `String` per scrape — see the
+    // doc on `metrics_server::serve`.
+    let metrics_for_server = worker_metrics.clone();
+    let metrics_token: Arc<str> = Arc::from(config.metrics_auth_token.as_str());
+    let metrics_addr = config.metrics_addr;
+    let shutdown_rx_for_metrics = shutdown_tx.subscribe();
+    let metrics_task = tokio::spawn(async move {
+        if let Err(e) = edge_worker::metrics_server::serve(
+            metrics_addr,
+            metrics_for_server,
+            metrics_token,
+            shutdown_rx_for_metrics,
+        )
+        .await
+        {
+            tracing::error!(err = %e, "metrics server exited with error");
+        }
+    });
+    tracing::info!(addr = %metrics_addr, "metrics server started");
 
     let heartbeat_supervisor = supervisor.clone();
     let heartbeat_interval = Duration::from_secs(config.heartbeat_interval_secs);
@@ -401,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_supervisor = supervisor.clone();
     // broadcast::Sender is Clone + Send + Sync, so no Arc is needed.
     let shutdown_tx_s = shutdown_tx.clone();
+    let metrics_task_for_shutdown = metrics_task;
     tokio::spawn(async move {
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => Some(s),
@@ -430,7 +451,13 @@ async fn main() -> anyhow::Result<()> {
             signal = signal_name,
             "received signal, initiating graceful shutdown"
         );
-        graceful_shutdown(shutdown_tx_s, shutdown_supervisor, logs_task).await;
+        graceful_shutdown(
+            shutdown_tx_s,
+            shutdown_supervisor,
+            logs_task,
+            metrics_task_for_shutdown,
+        )
+        .await;
     });
 
     tracing::info!(
@@ -551,7 +578,7 @@ fn reset_backoff_if_healthy(started_at: Instant, threshold: Duration) -> Option<
 /// out of per-worker keys by setting `WORKER_JWT_SECRET` directly.
 async fn resolve_jwt_secret(
     config: &Config,
-    identity: &crate::worker_key::WorkerIdentity,
+    identity: &WorkerIdentity,
 ) -> anyhow::Result<(Vec<u8>, Option<String>)> {
     // 1. Direct env-var path: legacy mode, no enrollment.
     if !config.worker_jwt_secret.is_empty() {
@@ -566,7 +593,7 @@ async fn resolve_jwt_secret(
 
     // 3. Persisted identity short-circuit.
     if !reenroll {
-        match crate::auth::load_persisted_identity(&config.worker_identity_path) {
+        match load_persisted_identity(&config.worker_identity_path) {
             Ok(Some(persisted)) => {
                 tracing::info!(
                     path = %config.worker_identity_path.display(),
@@ -600,7 +627,7 @@ async fn resolve_jwt_secret(
             reenroll,
             "running bootstrap enrollment handshake with control plane"
         );
-        let client = crate::bootstrap::BootstrapClient::new(
+        let client = BootstrapClient::new(
             config.control_plane_url.clone(),
             config.worker_bootstrap_secret.as_bytes().to_vec(),
             config.worker_id.clone(),
@@ -613,12 +640,12 @@ async fn resolve_jwt_secret(
             .context("bootstrap enrollment handshake")?;
 
         // Persist for next restart.
-        let persisted = crate::auth::PersistedIdentity {
+        let persisted = PersistedIdentity {
             kid: derived.kid.clone(),
             secret: derived.secret.clone(),
             public_key_hex: derived.public_key_hex.clone(),
         };
-        crate::auth::persist_identity(&config.worker_identity_path, &persisted)
+        persist_identity(&config.worker_identity_path, &persisted)
             .context("persisting worker identity after enrollment")?;
         tracing::info!(
             path = %config.worker_identity_path.display(),
@@ -687,8 +714,9 @@ async fn graceful_shutdown(
     shutdown_tx: broadcast::Sender<()>,
     supervisor: Arc<Supervisor>,
     logs_task: tokio::task::JoinHandle<()>,
+    metrics_task: tokio::task::JoinHandle<()>,
 ) {
-    // Signal the heartbeat + log-forwarder tasks to stop.
+    // Signal the heartbeat + log-forwarder + metrics tasks to stop.
     let _ = shutdown_tx.send(());
 
     tracing::info!("graceful shutdown: stopping all apps");
@@ -712,6 +740,19 @@ async fn graceful_shutdown(
     // when a shutdown loses an in-flight batch.
     tracing::info!("awaiting log forwarder final flush");
     drain_logs_task(Duration::from_secs(10), logs_task).await;
+
+    // Wait for the metrics server to drain. Abort after a short
+    // grace period — the broadcast has fired, but a slow connection
+    // could keep `serve_connection` alive for a few seconds.
+    let metrics_grace = Duration::from_secs(2);
+    match tokio::time::timeout(metrics_grace, metrics_task).await {
+        Ok(Ok(())) => tracing::info!("metrics server drained cleanly"),
+        Ok(Err(join_err)) => tracing::warn!(err = %join_err, "metrics server task ended"),
+        Err(_) => tracing::warn!(
+            timeout_secs = metrics_grace.as_secs(),
+            "metrics server drain timed out; connections may be cut",
+        ),
+    }
 
     tracing::info!("shutdown complete");
 }

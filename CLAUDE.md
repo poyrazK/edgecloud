@@ -353,6 +353,19 @@ Per-app, per-deployment:
 - On first startup, the worker has no JWT. `bootstrap.rs` hits an internal CP endpoint with `X-Internal-Token` to mint the worker JWT.
 - Subsequent restarts load the JWT from local cache. The cached JWT carries `tenant_id = "*"` (or `WORKER_TENANT_ID` if set) — every per-tenant request then uses that single tenant ID until a per-request JWT lands.
 
+### Prometheus `/metrics` endpoint (`edge-worker/src/metrics_server.rs`)
+
+Issue #49 — exposes per-deployment request / byte / duration / resident counters + worker-level gauges in Prometheus text format.
+
+- **Bind address** — `METRICS_ADDR`, default `0.0.0.0:9090` (the conventional Prometheus scrape port). Set to `127.0.0.1:9090` to bind localhost-only when scraping from a sidecar.
+- **Auth** — `METRICS_AUTH_TOKEN` (bearer). Empty token = server refuses every request with 401 (fail-closed). Operators MUST set this in any multi-tenant cluster; an empty value is a loud signal the deploy hasn't been configured. Tested at `edge-worker/src/metrics_server.rs::returns_401_when_authorization_header_missing` + `returns_401_when_token_mismatches`.
+- **Endpoint surface** — `GET /metrics` only. Everything else returns 404. The port is intentionally narrow — no `/`, no `/health`, no path traversal.
+- **Metric families** — `edge_requests_total`, `edge_outbound_bytes_total`, `edge_resident_seconds_total`, `edge_duration_ms_total` (all labeled `{deployment_id, app_name}`); `edge_app_status{deployment_id, app_name, status}` (single-row invariant — previous status is cleared before a new one is stamped, see `metrics::WorkerMetrics::set_status`; swept on `unregister_app`); `edge_app_terminal_status{deployment_id, app_name, status, exit_code}` (audit-style sibling that survives `unregister_app` — stamped once with the last known status; bounded by total deployments ever observed, not the running set, so no OOM hazard); `edge_worker_uptime_seconds`; `edge_worker_active_apps`.
+- **Wiring** — `Supervisor::start_app` (`edge-worker/src/supervisor.rs`) calls `register_app` (returns an `Arc<MetricsHandle>`), which is then cloned into `HandlerConfig.metrics_handle` for the FaaS path. The dispatch path mirrors every `meter.record_request()` / `record_outbound_bytes()` / `record_duration()` into the matching IntCounter on the same `MetricsHandle` (see `edge-worker/src/dispatch.rs::handle_request` — `stamp_duration` helper + inline `handle.requests.inc()` etc.). LongRunning resident time is stamped by the per-app `resident_ticker` (`handle.resident_seconds.inc_by(resident_tick_secs)` every heartbeat interval, LR apps only).
+- **Counter invariants** — the IntCounters are monotonic, NOT snapshot-and-subtract (the heartbeat does that on `RequestMeter` but the Prometheus counter is a running total). `edge_worker_active_apps` is a gauge set to the current map size; `edge_worker_uptime_seconds` is a gauge set to `started_at.elapsed().as_secs()`. `set_status` clears the previous series before stamping the new one so each `(deployment_id, app_name)` tuple has at most one row.
+- **Shutdown** — observes the same `tokio::sync::broadcast` channel the heartbeat + log forwarder watch. On graceful shutdown the metrics task is awaited with a 2s grace before being dropped (a slow connection could otherwise pin the task).
+- **Dependencies** — `prometheus = "0.13"` (default-features=false drops protobuf; text encoder only). `hyper-util` was promoted from a dev-dep to a regular dep so `TokioIo` is available in production code.
+
 ## edge-control-plane Deep Dive
 
 ### Composition root (`edge-control-plane/internal/app/app.go`)

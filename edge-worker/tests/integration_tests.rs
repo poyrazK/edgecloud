@@ -94,6 +94,8 @@ fn test_config(
         consumer_name: format!("test-{}", worker_id),
         queue_group: String::new(),
         worker_addr: "test-host:0".to_string(),
+        metrics_addr: "127.0.0.1:0".parse().unwrap(),
+        metrics_auth_token: String::new(),
         worker_jwt_secret: String::from_utf8(TEST_JWT_SECRET.to_vec()).unwrap(),
         worker_jwt_kid: None,
         worker_jwt_issuer: "edgecloud".to_string(),
@@ -185,6 +187,8 @@ impl TestHarness {
             worker_id: "test-worker".to_string(),
             region: "test-region".to_string(),
             worker_addr: "test-host:0".to_string(),
+            metrics_addr: "127.0.0.1:0".parse().unwrap(),
+            metrics_auth_token: String::new(),
             nats_url: String::new(), // overwritten by build_supervisor_with
             control_plane_url: mock_server.uri(),
             cache_dir: cache_dir.path().to_path_buf(),
@@ -436,6 +440,8 @@ async fn test_heartbeat_published_inner() -> anyhow::Result<()> {
         worker_id: "test-worker".to_string(),
         region: "test-region".to_string(),
         worker_addr: "test-host:0".to_string(),
+        metrics_addr: "127.0.0.1:0".parse().unwrap(),
+        metrics_auth_token: String::new(),
         nats_url: String::new(), // overwritten by build_supervisor_from_url
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: default_cache_dir(),
@@ -986,6 +992,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_id: "w_pinning_a".to_string(),
         region: region.to_string(),
         worker_addr: "test-host:0".to_string(),
+        metrics_addr: "127.0.0.1:0".parse().unwrap(),
+        metrics_auth_token: String::new(),
         nats_url: String::new(), // overwritten by build_supervisor_from_url
         control_plane_url: control_plane_url.clone(),
         cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-a"),
@@ -1030,6 +1038,8 @@ async fn test_queue_group_pinning_inner() -> anyhow::Result<()> {
         worker_id: "w_pinning_b".to_string(),
         region: region.to_string(),
         worker_addr: "test-host:0".to_string(),
+        metrics_addr: "127.0.0.1:0".parse().unwrap(),
+        metrics_auth_token: String::new(),
         nats_url: String::new(),
         control_plane_url: control_plane_url.clone(),
         cache_dir: PathBuf::from("/tmp/edge-worker-test-pinning-b"),
@@ -1895,6 +1905,8 @@ async fn build_supervisor_only_with_cp(
         worker_id: worker_id.to_string(),
         region: region.to_string(),
         worker_addr: "test-host:0".to_string(),
+        metrics_addr: "127.0.0.1:0".parse().unwrap(),
+        metrics_auth_token: String::new(),
         nats_url: String::new(), // overwritten by build_supervisor_with
         control_plane_url: control_plane_url.to_string(),
         cache_dir: PathBuf::from("/tmp/edge-worker-sync-test-cache"),

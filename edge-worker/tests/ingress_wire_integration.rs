@@ -53,6 +53,8 @@ fn wire_test_config(
         worker_id: worker_id.to_string(),
         region: region.to_string(),
         worker_addr: worker_addr.to_string(),
+        metrics_addr: "127.0.0.1:0".parse().unwrap(),
+        metrics_auth_token: String::new(),
         nats_url: String::new(), // overwritten by build_supervisor_from_url
         control_plane_url: "http://localhost:9999".to_string(),
         cache_dir: default_cache_dir(),

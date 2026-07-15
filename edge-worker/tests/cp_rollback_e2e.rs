@@ -151,6 +151,8 @@ async fn run_e2e() -> anyhow::Result<()> {
         worker_id: "test-worker".to_string(),
         region: TEST_REGION.to_string(),
         worker_addr: "test-host:0".to_string(),
+        metrics_addr: "127.0.0.1:0".parse().unwrap(),
+        metrics_auth_token: String::new(),
         nats_url: String::new(), // overwritten by build_supervisor_from_url
         control_plane_url: mock_server.uri(),
         cache_dir: cache_dir.path().to_path_buf(),

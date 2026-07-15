@@ -197,6 +197,7 @@ impl LayerHarness {
             cpu_budget_ms: 1000,
             preview_id: None,
             preview_pr_number: None,
+            metrics_handle: None,
         };
 
         let state = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -382,6 +383,7 @@ async fn l6_request_body_over_cap_returns_413() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -440,6 +442,7 @@ async fn l6b_request_body_under_cap_reaches_guest() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -530,6 +533,7 @@ async fn l7_per_request_timeout_returns_500() {
         cpu_budget_ms: 100,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     };
 
     let state = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -799,6 +803,7 @@ async fn l11_guest_calls_process_get_env() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -854,6 +859,7 @@ async fn l12_guest_calls_time_now() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -913,6 +919,7 @@ async fn l13_guest_calls_kv_store_round_trip() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -996,6 +1003,7 @@ async fn l14_guest_calls_cache_round_trip() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -1076,6 +1084,7 @@ async fn l15_guest_emit_log_reaches_sink() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -1143,6 +1152,7 @@ async fn l16_guest_schedules_task() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -1200,6 +1210,7 @@ fn test_config(app_name: &str) -> HandlerConfig {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     }
 }
 
@@ -1498,6 +1509,7 @@ async fn l27_process_get_all_env() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
     let cl = make_client();
@@ -1591,6 +1603,7 @@ async fn l45_outbound_metering_counts_response_bytes() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 
@@ -2060,6 +2073,7 @@ async fn l46_sse_endpoint_streams_headers_then_body_chunks() {
         cpu_budget_ms: 1000,
         preview_id: None,
         preview_pr_number: None,
+        metrics_handle: None,
     })
     .await;
 

@@ -480,7 +480,28 @@ Supervisor publishes to NATS subject `edgecloud.heartbeats.<region>`:
 
 Heartbeat interval: **30 seconds**.
 
-### 5.7 Graceful Shutdown
+### 5.7 Worker `/metrics` endpoint (issue #49)
+
+Each `edge-worker` process exposes a Prometheus-format metrics endpoint
+for scraping per-app counters without going through the control plane.
+Binds to `METRICS_ADDR` (default `0.0.0.0:9090`) and serves one
+endpoint: `GET /metrics`. Bearer-token auth via `METRICS_AUTH_TOKEN`;
+empty token = every request returns 401 (fail-closed).
+
+Metric families:
+
+- `edge_requests_total{deployment_id, app_name}` — monotonic FaaS request counter (mirrors `RequestMeter::record_request`).
+- `edge_outbound_bytes_total{deployment_id, app_name}` — monotonic FaaS response byte counter (mirrors `RequestMeter::record_outbound_bytes`).
+- `edge_duration_ms_total{deployment_id, app_name}` — monotonic FaaS wall-clock latency (mirrors `RequestMeter::record_duration`).
+- `edge_resident_seconds_total{deployment_id, app_name}` — LongRunning resident-time ticker (bumped every heartbeat interval for LR apps only).
+- `edge_app_status{deployment_id, app_name, status}` — gauge. Single-row invariant: previous status is cleared before a new one is stamped. `Supervisor::stop_app` stamps `Draining` before signaling serve() to stop accepting and `Stopping` after the in-flight drain completes, so the gauge reflects the full lifecycle (running → draining → stopping) before `unregister_app` sweeps it.
+- `edge_app_terminal_status{deployment_id, app_name, status, exit_code}` — audit-style sibling of `edge_app_status`. Stamped once from `unregister_app` AFTER the last known status is read from the in-memory `last_status` map, then persisted across unregister. Operators query this to learn why an unregistered app died (`Crashed`/`Hung` etc.) since `edge_app_status` for the same key is gone. Cardinality is bounded by total deployments ever observed on the worker (one row per `(deployment_id, app_name)`), not by the currently-running set — the long-lived-worker OOM hazard that motivates sweeping `edge_app_status` does not apply.
+- `edge_worker_uptime_seconds` — worker process uptime.
+- `edge_worker_active_apps` — current count of running apps.
+
+The counters are intentionally redundant with `HeartbeatMessage.{request_count, outbound_bytes, duration_ms_total, resident_seconds}`: the heartbeat is for billing (snapshot-and-subtract per heartbeat), the Prometheus counter is for operator dashboards (monotonic running total). They are NOT a duplicate channel — both are wired at the dispatch path.
+
+### 5.8 Graceful Shutdown
 
 On SIGTERM:
 1. Stop accepting NATS messages
