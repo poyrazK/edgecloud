@@ -41,6 +41,14 @@ func (m *mockRollbackArtifactStore) Delete(ctx context.Context, tenantID, appNam
 	return m.deleteFn(ctx, tenantID, appName, deploymentID)
 }
 
+// DeleteFormat is a no-op here: rollback doesn't touch .cwasm (the
+// precompiled counterpart lives on the AppService.Delete path; issue
+// #60). Defined to keep mockRollbackArtifactStore satisfying the
+// ArtifactStore interface.
+func (m *mockRollbackArtifactStore) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	return nil
+}
+
 func TestRollbackArtifactSave_AllCleanupSucceedsReturnsSaveErr(t *testing.T) {
 	saveErr := errors.New("io error during save")
 	repo := &mockRollbackDeploymentRepo{deleteByIDFn: func(ctx context.Context, id string) error { return nil }}

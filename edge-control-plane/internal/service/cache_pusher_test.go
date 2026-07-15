@@ -35,6 +35,9 @@ func (m *mockArtifactStoreForCache) OpenFormat(ctx context.Context, tenantID, ap
 func (m *mockArtifactStoreForCache) Delete(ctx context.Context, tenantID, appName, deploymentID string) error {
 	return nil
 }
+func (m *mockArtifactStoreForCache) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	return nil
+}
 
 func TestNewHTTPArtifactCachePusher_HasTimeout(t *testing.T) {
 	p := NewHTTPArtifactCachePusher(&mockArtifactStoreForCache{}, "token")

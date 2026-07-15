@@ -42,6 +42,16 @@ type ArtifactStore interface {
 	// alongside the default .wasm file. Used by the pre-compilation step
 	// to store AOT-compiled components on the control plane.
 	SaveFormat(ctx context.Context, tenantID, appName, deploymentID, format string, r io.Reader) error
+	// DeleteFormat removes a companion artifact (e.g. a .cwasm
+	// precompiled blob) at the given format. Idempotent: a missing
+	// companion file is not an error. Used by AppService.Delete
+	// (issue #60) to clean up the .cwasm pair alongside the .wasm
+	// when an app is removed — without this, the precompiled blob
+	// outlives the app on every backend.
+	//
+	// format accepts "" / "wasm" (delegates to Delete) or "cwasm".
+	// Other values return an error without making any I/O call.
+	DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error
 }
 
 // FSArtifactStore is the filesystem-backed implementation of
@@ -344,6 +354,46 @@ func (s *FSArtifactStore) SaveFormat(ctx context.Context, tenantID, appName, dep
 	if err := os.Rename(tmp, path); err != nil {
 		cleanup()
 		return fmt.Errorf("renaming artifact: %w", err)
+	}
+	return nil
+}
+
+// DeleteFormat removes a companion artifact at the given format. The
+// "" and "wasm" forms delegate to Delete so the default-extension
+// path is the same single code path. "cwasm" removes
+// `<basePath>/<tenantID>/<appName>/<deploymentID>.cwasm`. Idempotent:
+// missing files return nil, mirroring Delete's contract so
+// AppService.Delete can loop over deployments without surfacing
+// spurious errors on concurrent deletes. Other formats return an
+// error without touching the filesystem.
+//
+// ctx is ignored — `os.Remove` does not take a context. See
+// `Delete` for the matching rationale.
+func (s *FSArtifactStore) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	if format == "" || format == "wasm" {
+		return s.Delete(ctx, tenantID, appName, deploymentID)
+	}
+	if format != "cwasm" {
+		return fmt.Errorf("unsupported format %q", format)
+	}
+
+	if err := validatePathComponent("tenantID", tenantID); err != nil {
+		return err
+	}
+	if err := validatePathComponent("appName", appName); err != nil {
+		return err
+	}
+	if err := validatePathComponent("deploymentID", deploymentID); err != nil {
+		return err
+	}
+
+	path := filepath.Join(s.basePath, tenantID, appName, deploymentID+".cwasm")
+	clean := filepath.Clean(path)
+	if !strings.HasPrefix(clean, filepath.Clean(s.basePath)) {
+		return fmt.Errorf("path traversal detected")
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	return nil
 }

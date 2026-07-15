@@ -94,6 +94,13 @@ func (m *mockDeploymentGCArtifactStore) Delete(ctx context.Context, tenantID, ap
 	return m.err
 }
 
+// DeleteFormat is a no-op for the GC: the deployment-row GC only
+// removes the .wasm blob. Companion .cwasm cleanup is bound to the
+// app lifecycle (AppService.Delete, issue #60), not the row TTL.
+func (m *mockDeploymentGCArtifactStore) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	return nil
+}
+
 func (m *mockDeploymentGCArtifactStore) deleteCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

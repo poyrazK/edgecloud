@@ -283,6 +283,19 @@ func (s *RemoteArtifactStore) Delete(ctx context.Context, tenantID, appName, dep
 	return s.cache.Delete(ctx, tenantID, appName, deploymentID)
 }
 
+// DeleteFormat removes the local cache entry for the given format only.
+// The "" / "wasm" / "cwasm" forms all delegate to the underlying
+// FSArtifactStore.DeleteFormat — the peer CP is not contacted, mirroring
+// Delete's local-only semantics. Cross-CP GC for companion artifacts is a
+// separate concern (issue #60); a peer with stale cached blobs is
+// harmless because the worker re-verifies the artifact hash on
+// download.
+//
+// Other formats return an error before any I/O.
+func (s *RemoteArtifactStore) DeleteFormat(ctx context.Context, tenantID, appName, deploymentID, format string) error {
+	return s.cache.DeleteFormat(ctx, tenantID, appName, deploymentID, format)
+}
+
 // SaveAndHash writes the artifact to the local cache while computing
 // its SHA-256 in the same pass. Streams r through io.TeeReader to
 // both the cache.Save call and a sha256 hasher — no intermediate

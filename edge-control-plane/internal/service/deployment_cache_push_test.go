@@ -228,6 +228,12 @@ func (f fakeArtifactStore) Delete(_ context.Context, _, _, _ string) error {
 	return nil
 }
 
+// DeleteFormat is a no-op (the pusher doesn't delete). Issue #60
+// added this method to ArtifactStore; the cache pusher never calls it.
+func (f fakeArtifactStore) DeleteFormat(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+
 // contains is a tiny strings.Contains — defined here to avoid an
 // extra import for one assertion.
 func contains(s, substr string) bool {

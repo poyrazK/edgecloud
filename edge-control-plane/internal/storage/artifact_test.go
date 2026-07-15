@@ -414,3 +414,92 @@ func TestFSArtifactStore_OpenFormat(t *testing.T) {
 		t.Fatalf("expected unsupported format error, got %v", err)
 	}
 }
+
+// TestFSArtifactStore_DeleteFormat_RemovesCwasm covers the
+// happy path of issue #60's artifact-cleanup half: a .cwasm saved
+// via SaveFormat goes away on DeleteFormat(_, "cwasm"), and a
+// second DeleteFormat call returns nil (idempotent) instead of
+// bubbling os.ErrNotExist up to the caller.
+func TestFSArtifactStore_DeleteFormat_RemovesCwasm(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFSArtifactStore(dir)
+
+	if err := s.SaveFormat(context.Background(), "t_1", "hello", "d_1", "cwasm", bytes.NewReader([]byte("native code"))); err != nil {
+		t.Fatalf("SaveFormat: %v", err)
+	}
+	cwasmPath := filepath.Join(dir, "t_1", "hello", "d_1.cwasm")
+	if _, err := os.Stat(cwasmPath); err != nil {
+		t.Fatalf("cwasm not on disk after SaveFormat: %v", err)
+	}
+
+	if err := s.DeleteFormat(context.Background(), "t_1", "hello", "d_1", "cwasm"); err != nil {
+		t.Fatalf("DeleteFormat cwasm: %v", err)
+	}
+	if _, err := os.Stat(cwasmPath); !os.IsNotExist(err) {
+		t.Errorf("cwasm still on disk after DeleteFormat: %v", err)
+	}
+
+	// Idempotent — a concurrent or repeated delete must not surface
+	// os.ErrNotExist to the caller. Mirrors FSArtifactStore.Delete's
+	// contract so AppService.Delete's error aggregation doesn't drown
+	// in missing-file noise.
+	if err := s.DeleteFormat(context.Background(), "t_1", "hello", "d_1", "cwasm"); err != nil {
+		t.Errorf("DeleteFormat on missing cwasm: want nil, got %v", err)
+	}
+}
+
+// TestFSArtifactStore_DeleteFormat_EmptyAndWasmDelegateToDelete
+// pins the contract that "" / "wasm" both go through the regular
+// Delete path. An app with no AOT-compiled counterpart should pay the
+// exact same I/O cost whether the caller passes "" or "wasm".
+func TestFSArtifactStore_DeleteFormat_EmptyAndWasmDelegateToDelete(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFSArtifactStore(dir)
+	ctx := context.Background()
+
+	// Empty format.
+	if err := s.Save(ctx, "t_1", "hello", "d_1", bytes.NewReader([]byte("wasm"))); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := s.DeleteFormat(ctx, "t_1", "hello", "d_1", ""); err != nil {
+		t.Fatalf("DeleteFormat empty: %v", err)
+	}
+	wasmPath, _ := s.Path("t_1", "hello", "d_1")
+	if _, err := os.Stat(wasmPath); !os.IsNotExist(err) {
+		t.Errorf("DeleteFormat(\"\") did not remove .wasm: %v", err)
+	}
+
+	// "wasm" format.
+	if err := s.Save(ctx, "t_1", "hello", "d_1", bytes.NewReader([]byte("wasm"))); err != nil {
+		t.Fatalf("Save again: %v", err)
+	}
+	if err := s.DeleteFormat(ctx, "t_1", "hello", "d_1", "wasm"); err != nil {
+		t.Fatalf("DeleteFormat wasm: %v", err)
+	}
+	if _, err := os.Stat(wasmPath); !os.IsNotExist(err) {
+		t.Errorf("DeleteFormat(\"wasm\") did not remove .wasm: %v", err)
+	}
+}
+
+// TestFSArtifactStore_DeleteFormat_RejectsUnsupportedFormat guards
+// against future format additions that forget to update the path
+// validation. Any string outside { "", "wasm", "cwasm" } returns an
+// error before any I/O.
+func TestFSArtifactStore_DeleteFormat_RejectsUnsupportedFormat(t *testing.T) {
+	dir := t.TempDir()
+	s := NewFSArtifactStore(dir)
+	ctx := context.Background()
+
+	cases := []string{"js", "wasm-eval", "../etc/cwasm", "wat"}
+	for _, fmt := range cases {
+		t.Run(fmt, func(t *testing.T) {
+			err := s.DeleteFormat(ctx, "t_1", "hello", "d_1", fmt)
+			if err == nil {
+				t.Fatalf("DeleteFormat(%q): expected error, got nil", fmt)
+			}
+			if !strings.Contains(err.Error(), "unsupported format") {
+				t.Errorf("DeleteFormat(%q) err = %v, want unsupported-format message", fmt, err)
+			}
+		})
+	}
+}
