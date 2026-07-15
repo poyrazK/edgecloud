@@ -48,16 +48,16 @@ type appRepoInterface interface {
 
 // AppService handles app business logic.
 type AppService struct {
-	db              *sqlx.DB
-	appRepo         appRepoInterface
-	appEnvRepo      *repository.AppEnvRepository
-	activeRepo      *repository.ActiveDeploymentRepository
-	deployRepo      *repository.DeploymentRepository
+	db               *sqlx.DB
+	appRepo          appRepoInterface
+	appEnvRepo       *repository.AppEnvRepository
+	activeRepo       *repository.ActiveDeploymentRepository
+	deployRepo       *repository.DeploymentRepository
 	trafficSplitRepo *repository.TrafficSplitRepository
-	artifactStore   storage.ArtifactStore
-	quotaRepo       quotaRepoInterface
-	outboxRepo      *repository.OutboxRepository
-	defaultRegion   string
+	artifactStore    storage.ArtifactStore
+	quotaRepo        quotaRepoInterface
+	outboxRepo       *repository.OutboxRepository
+	defaultRegion    string
 	// l4PortRangeStart and l4PortRangeEnd bound the L4/TCP port
 	// range used by AllocateL4Port (issue #548). Configured via
 	// cfg.L4.PortRangeStart / cfg.L4.PortRangeEnd and threaded into
@@ -326,7 +326,7 @@ func (s *AppService) Update(ctx context.Context, tenantID, appName string, req *
 // PostgreSQL transaction, so the artifact pass is best-effort and
 // post-commit errors are aggregated with errors.Join and returned
 // to the caller; the HTTP handler maps non-ErrAppNotFound errors to
-// 500.
+// 500. See issue #60.
 var ErrAppNotFound = fmt.Errorf("app not found")
 
 func (s *AppService) Delete(ctx context.Context, tenantID, appName string) error {
