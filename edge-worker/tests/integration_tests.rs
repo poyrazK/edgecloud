@@ -26,7 +26,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use edge_runtime::interfaces::observe::LogSink;
 use edge_worker::config::Config;
-use edge_worker::messages::{AppSpec, HeartbeatMessage, TaskMessage};
+use edge_worker::messages::{AppSpec, DeploymentRoute, HeartbeatMessage, TaskMessage};
 use edge_worker::state::AppInstanceStatus;
 use edge_worker::supervisor::Supervisor;
 use edge_worker::verifier::Keyring;
@@ -292,14 +292,22 @@ async fn recv_heartbeat(sub: &mut async_nats::Subscriber) -> anyhow::Result<Hear
 /// Helper: wait for an app to appear in state with Running status.
 ///
 /// `state.apps` is keyed by `(tenant_id, app_name)` since Phase B; the
-/// helpers need both to construct the lookup key.
-async fn wait_for_app_running(supervisor: &Supervisor, app_name: &str, timeout_secs: u64) -> bool {
+/// helpers need all three to construct the lookup key.
+async fn wait_for_app_running(
+    supervisor: &Supervisor,
+    app_name: &str,
+    deployment_id: &str,
+    timeout_secs: u64,
+) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
         for inst in state.apps.values() {
             let inst = inst.lock().await;
-            if inst.app_name == app_name && matches!(inst.status, AppInstanceStatus::Running) {
+            if inst.app_name == app_name
+                && inst.deployment_id == deployment_id
+                && matches!(inst.status, AppInstanceStatus::Running)
+            {
                 return true;
             }
         }
@@ -313,14 +321,15 @@ async fn wait_for_app_gone(
     supervisor: &Supervisor,
     tenant_id: &str,
     app_name: &str,
+    deployment_id: &str,
     timeout_secs: u64,
 ) -> bool {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     while tokio::time::Instant::now() < deadline {
         let state = supervisor.state.read().await;
         let mut found = false;
-        for ((t, n, _d), _inst) in state.apps.iter() {
-            if t == tenant_id && n == app_name {
+        for ((t, n, d), _inst) in state.apps.iter() {
+            if t == tenant_id && n == app_name && d == deployment_id {
                 found = true;
                 break;
             }
@@ -382,7 +391,7 @@ async fn test_app_lifecycle() {
         .expect("handle_task_message");
 
     // Step 2: app should be Running
-    let running = wait_for_app_running(&harness.supervisor, "test-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "test-app", "d_deploy_001", 10).await;
     assert!(
         running,
         "app should be Running within 10s (check NATS connectivity and component compilation)"
@@ -417,7 +426,7 @@ async fn test_app_lifecycle() {
         .expect("handle_task_message");
 
     // Step 5: app should be removed from state
-    let gone = wait_for_app_gone(&harness.supervisor, "t_test", "test-app", 10).await;
+    let gone = wait_for_app_gone(&harness.supervisor, "t_test", "test-app", "d_deploy_001", 10).await;
     assert!(gone, "app should be removed from state after stop");
 }
 
@@ -581,7 +590,13 @@ async fn test_stop_all_apps() {
 
     // Wait for both apps to be running (not a fixed sleep)
     for i in 0..2 {
-        let running = wait_for_app_running(&harness.supervisor, &format!("app-{}", i), 10).await;
+        let running = wait_for_app_running(
+            &harness.supervisor,
+            &format!("app-{}", i),
+            &format!("d_deploy_{:03}", i),
+            10,
+        )
+        .await;
         assert!(running, "app-{} should be running within 10s", i);
     }
 
@@ -646,7 +661,7 @@ async fn test_artifact_hash_match_starts_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "hash-match-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "hash-match-app", "d_hash_match", 10).await;
     assert!(running, "matching-hash app should reach Running within 10s");
 }
 
@@ -740,7 +755,7 @@ async fn test_artifact_hash_mismatch_rejects_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "good-hash-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "good-hash-app", "d_hash_good", 10).await;
     assert!(
         running,
         "matching-hash app should reach Running within 10s — proves port was released after the failed start"
@@ -808,7 +823,7 @@ async fn test_cached_tampered_artifact_is_redownloaded() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "cache-redownload-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "cache-redownload-app", "d_cache_redownload", 10).await;
     assert!(
         running,
         "app should reach Running within 10s — proves the worker tolerated the bad cache and re-downloaded"
@@ -1316,7 +1331,7 @@ async fn test_emit_log_reaches_log_ingest_endpoint() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "log-emit-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "log-emit-app", "d_log_emit", 10).await;
     assert!(
         running,
         "app should reach Running within 10s — proves supervisor wiring is healthy"
@@ -1506,7 +1521,7 @@ async fn test_emit_log_reaches_ingest_within_5s() {
     // Wait until the app is Running so the forwarder has a live
     // AppLogContext for it. Once it is, any record we push with
     // that context will produce a POST to /api/internal/logs.
-    let running = wait_for_app_running(&harness.supervisor, "log-emit-sla", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "log-emit-sla", "d_log_emit_sla", 10).await;
     assert!(running, "app should reach Running within 10s");
 
     // Wall-clock measurement: the SLA is from `push()` to the
@@ -2045,7 +2060,7 @@ async fn test_artifact_signature_match_starts_app() {
         .await
         .expect("handle_task_message");
 
-    let running = wait_for_app_running(&harness.supervisor, "sig-match-app", 10).await;
+    let running = wait_for_app_running(&harness.supervisor, "sig-match-app", "d_sig_match", 10).await;
     assert!(
         running,
         "valid-signature app should reach Running within 10s"
@@ -2164,7 +2179,7 @@ async fn test_artifact_signature_cache_hit_re_verifies() {
         .await
         .expect("first handle_task_message");
     assert!(
-        wait_for_app_running(&harness.supervisor, "sig-cache-app", 10).await,
+        wait_for_app_running(&harness.supervisor, "sig-cache-app", "d_sig_cache", 10).await,
         "valid-sig app should reach Running within 10s"
     );
 
@@ -2352,5 +2367,195 @@ async fn test_artifact_missing_signature_rejects_when_required() {
         received.is_empty(),
         "early-reject must prevent any download; got {} requests",
         received.len()
+    );
+}
+
+/// Canary / blue-green fan-out (issue #290): a single TaskMessage
+/// carrying `routes: Some([d_v1, d_v2])` must produce TWO
+/// concurrently-running app instances under the same
+/// `(tenant, app_name)` — one per deployment — with distinct ports,
+/// distinct state-map keys, and distinct per-deployment artifacts
+/// (different `deployment_hash` per route).
+///
+/// This exercises the full `expand_routes` → `compute_app_diff` →
+/// `start_app` → `state.apps` triple-key path. No CP / ingress
+/// changes — the worker is now canary-ready locally.
+#[tokio::test]
+async fn test_canary_two_deployments_concurrently_running() {
+    if should_skip_integration_tests() {
+        eprintln!("SKIPPED: integration tests skipped (Docker unavailable or CI)");
+        return;
+    }
+
+    let harness = TestHarness::new().await.expect("create test harness");
+
+    // Wire up the mock HTTP server to serve the test component for
+    // BOTH deployment ids. Each route carries its own
+    // deployment_hash so the downloader treats them as distinct
+    // artifacts — wireMock matches by URL path, so distinct ids =
+    // distinct downloads.
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_canary_v1"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/internal/download/d_canary_v2"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(test_component_bytes()))
+        .mount(&harness.mock_server)
+        .await;
+
+    // The canary fan-out shape: one AppSpec carrying `routes` with
+    // two entries, each with its own deployment_id + hash. Note the
+    // primary `deployment_id` / `deployment_hash` are still required
+    // by serde — `expand_routes` ignores them when `routes` is Some,
+    // but the wire shape mirrors the Go control plane's
+    // TrafficService.publishTaskUpdate.
+    let spec = AppSpec {
+        deployment_id: "d_PRIMARY".to_string(),
+        deployment_hash: "ignored-by-expand_routes".to_string(),
+        deployment_signature: None,
+        signing_key_id: None,
+        routes: Some(vec![
+            DeploymentRoute {
+                deployment_id: "d_canary_v1".to_string(),
+                deployment_hash: test_component_hash(),
+                deployment_signature: None,
+                signing_key_id: None,
+                weight: 80,
+            },
+            DeploymentRoute {
+                deployment_id: "d_canary_v2".to_string(),
+                deployment_hash: test_component_hash(),
+                deployment_signature: None,
+                signing_key_id: None,
+                weight: 20,
+            },
+        ]),
+        env: HashMap::new(),
+        allowlist: None,
+        socket_mode: None,
+        max_memory_mb: 256,
+        cpu_budget_ms: None,
+        preview_id: None,
+        preview_pr_number: None,
+    };
+    let msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-07-15T00:00:00Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("canary-app".to_string(), spec)]),
+    };
+    harness
+        .supervisor
+        .handle_task_message(msg)
+        .await
+        .expect("handle_task_message");
+
+    // Both deployments should be running under the same
+    // `(tenant, app_name)` but distinct `deployment_id` keys.
+    assert!(
+        wait_for_app_running(&harness.supervisor, "canary-app", "d_canary_v1", 15).await,
+        "canary-app/d_canary_v1 must be Running within 15s"
+    );
+    assert!(
+        wait_for_app_running(&harness.supervisor, "canary-app", "d_canary_v2", 15).await,
+        "canary-app/d_canary_v2 must be Running within 15s"
+    );
+
+    // The state map must hold BOTH deployments under distinct
+    // (tenant_id, app_name, deployment_id) keys.
+    let state = harness.supervisor.state.read().await;
+    assert_eq!(
+        state.apps.len(),
+        2,
+        "canary fan-out must yield 2 state-map entries; got {:?}",
+        state.apps.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        state
+            .apps
+            .contains_key(&("t_test".to_string(), "canary-app".to_string(), "d_canary_v1".to_string())),
+        "state must contain (t_test, canary-app, d_canary_v1)"
+    );
+    assert!(
+        state
+            .apps
+            .contains_key(&("t_test".to_string(), "canary-app".to_string(), "d_canary_v2".to_string())),
+        "state must contain (t_test, canary-app, d_canary_v2)"
+    );
+
+    // The two instances must hold DIFFERENT ports — the port pool
+    // allocates one slot per deployment so they can co-host on the
+    // same worker without colliding.
+    // Drop the state.read() guard before awaiting per-instance
+    // locks (would otherwise hold the read lock while waiting on
+    // an inner mutex).
+    let keys: Vec<_> = state.apps.keys().cloned().collect();
+    drop(state);
+    let mut ports: Vec<u16> = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let state = harness.supervisor.state.read().await;
+        if let Some(inst) = state.apps.get(key) {
+            let inst = inst.lock().await;
+            ports.push(inst.port);
+        }
+    }
+    ports.sort();
+    ports.dedup();
+    assert_eq!(
+        ports.len(),
+        2,
+        "canary deployments must hold distinct ports; got {:?}",
+        ports
+    );
+
+    // Sanity: the heartbeat reflects both deployments under
+    // `"{app_name}:{deployment_id}"` composite keys (Commit 6).
+    let hb = harness.supervisor.build_heartbeat().await;
+    assert!(
+        hb.apps.contains_key("canary-app:d_canary_v1"),
+        "heartbeat must carry canary-app:d_canary_v1 composite key"
+    );
+    assert!(
+        hb.apps.contains_key("canary-app:d_canary_v2"),
+        "heartbeat must carry canary-app:d_canary_v2 composite key"
+    );
+
+    // Canary retirement: a TaskMessage without `routes` (legacy
+    // single-deployment shape) carrying only d_canary_v1 must stop
+    // d_canary_v2 — diff's canary clear path (Commit 5).
+    let retire_spec = AppSpec {
+        deployment_id: "d_canary_v1".to_string(),
+        deployment_hash: test_component_hash(),
+        deployment_signature: None,
+        signing_key_id: None,
+        routes: None,
+        env: HashMap::new(),
+        allowlist: None,
+        socket_mode: None,
+        max_memory_mb: 256,
+        cpu_budget_ms: None,
+        preview_id: None,
+        preview_pr_number: None,
+    };
+    let retire_msg = TaskMessage::TaskUpdate {
+        timestamp: "2026-07-15T00:00:01Z".to_string(),
+        tenant_id: "t_test".to_string(),
+        apps: HashMap::from([("canary-app".to_string(), retire_spec)]),
+    };
+    harness
+        .supervisor
+        .handle_task_message(retire_msg)
+        .await
+        .expect("handle_task_message retirement");
+
+    assert!(
+        wait_for_app_gone(&harness.supervisor, "t_test", "canary-app", "d_canary_v2", 15).await,
+        "d_canary_v2 must be gone after canary retirement"
+    );
+    // v1 keeps running.
+    assert!(
+        wait_for_app_running(&harness.supervisor, "canary-app", "d_canary_v1", 5).await,
+        "d_canary_v1 must keep running after canary retirement"
     );
 }
