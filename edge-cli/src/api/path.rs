@@ -139,11 +139,11 @@ mod tests {
         // tab/newline/CR (covered by both the literal list and
         // `is_control()`).
         for v in [
-            "a\x01b",      // SOH
-            "a\x07b",      // BEL
-            "a\x0bb",      // vertical tab (C0 control, not in literal list)
-            "a\x1fb",      // unit separator
-            "a\x7fb",      // DEL
+            "a\x01b", // SOH
+            "a\x07b", // BEL
+            "a\x0bb", // vertical tab (C0 control, not in literal list)
+            "a\x1fb", // unit separator
+            "a\x7fb", // DEL
         ] {
             let err = validate_path_component("p", v).unwrap_err();
             assert!(
@@ -153,10 +153,10 @@ mod tests {
         }
 
         // C1 controls: the bytes \x80..\x9f are *not* literal-listed,
-// but `is_control()` catches them. This is the path that a
-// misclassified "non-ASCII" check might miss — pin it. C1 controls
-// are valid Unicode codepoints (U+0080..U+009F) but are not valid
-// UTF-8 single-byte sequences; encode them via `char::from_u32`.
+        // but `is_control()` catches them. This is the path that a
+        // misclassified "non-ASCII" check might miss — pin it. C1 controls
+        // are valid Unicode codepoints (U+0080..U+009F) but are not valid
+        // UTF-8 single-byte sequences; encode them via `char::from_u32`.
         for v in [
             format!("a{}b", char::from_u32(0x80).unwrap()),
             format!("a{}b", char::from_u32(0x8F).unwrap()),
