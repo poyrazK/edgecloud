@@ -1995,8 +1995,13 @@ export interface components {
             apps?: components["schemas"]["App"][];
             /** @example 50 */
             limit?: number;
-            /** @example 0 */
-            offset?: number;
+            /**
+             * @description Opaque keyset cursor for the next page. Pass back as
+             *     `?cursor=` to fetch the next page of apps ordered by name.
+             *     Absent (or null) on the final page. Issue #58.
+             * @example eyJ2IjoxLCJwIjp7Im5hbWUiOiJiYXR0In19
+             */
+            next_cursor?: string | null;
         };
         Deployment: {
             /** @example d_abc123 */
@@ -2083,8 +2088,27 @@ export interface components {
             total?: number;
             /** @example 20 */
             limit?: number;
-            /** @example 0 */
-            offset?: number;
+            /**
+             * @description Opaque keyset cursor for the next page on
+             *     (created_at, id). Pass back as `?cursor=` to fetch the
+             *     next page. Absent (or null) on the final page. Issue #58.
+             * @example eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6NDJ9fQ
+             */
+            next_cursor?: string | null;
+            /**
+             * @deprecated
+             * @description **Deprecated.** Legacy `LIMIT … OFFSET` arithmetic kept
+             *     for one compat release so the existing CLI's `--page`
+             *     math works against the new server. Use `next_cursor`
+             *     instead. Emitted ONLY on first-page responses (when
+             *     no `?cursor=` is supplied); cursor-driven pages omit
+             *     this because there's no well-defined offset once the
+             *     client has jumped forward in the cursor chain. Will be
+             *     removed in the next compat cycle — see #58-followup.
+             *     Issue #58.
+             * @example 20
+             */
+            next_offset?: number | null;
         };
         ActivateResponse: {
             /** @example activated */
@@ -3297,7 +3321,12 @@ export interface operations {
         parameters: {
             query?: {
                 limit?: number;
-                offset?: number;
+                /**
+                 * @description Opaque keyset cursor returned as `next_cursor` from a
+                 *     prior `listApps` call. Pass it back to fetch the next
+                 *     page. Absent (or empty string) means first page. Issue #58.
+                 */
+                cursor?: string;
             };
             header?: never;
             path?: never;
@@ -3314,6 +3343,7 @@ export interface operations {
                     "application/json": components["schemas"]["AppListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
         };
@@ -3509,6 +3539,22 @@ export interface operations {
         parameters: {
             query?: {
                 limit?: number;
+                /**
+                 * @description Opaque keyset cursor returned as `next_cursor` from a
+                 *     prior `listDeployments` call. Pass it back to fetch the
+                 *     next page of deployments ordered by (created_at DESC,
+                 *     id DESC). Mutually exclusive with `?offset=` (400).
+                 *     Issue #58.
+                 */
+                cursor?: string;
+                /**
+                 * @deprecated
+                 * @description **Deprecated.** Legacy `LIMIT … OFFSET` arithmetic.
+                 *     Use `?cursor=` instead. Retained for one compat release
+                 *     so the existing CLI's `--page` flag keeps working. Will
+                 *     be removed in the next compat cycle — see #58-followup.
+                 *     Issue #58.
+                 */
                 offset?: number;
             };
             header?: never;
@@ -3529,6 +3575,7 @@ export interface operations {
                     "application/json": components["schemas"]["DeploymentListResponse"];
                 };
             };
+            400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
         };

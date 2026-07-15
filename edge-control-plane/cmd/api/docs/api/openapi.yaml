@@ -640,9 +640,14 @@ components:
         limit:
           type: integer
           example: 50
-        offset:
-          type: integer
-          example: 0
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque keyset cursor for the next page. Pass back as
+            `?cursor=` to fetch the next page of apps ordered by name.
+            Absent (or null) on the final page. Issue #58.
+          example: eyJ2IjoxLCJwIjp7Im5hbWUiOiJiYXR0In19
 
     # -------------------------------------------------------------------------
     # Deployments
@@ -739,9 +744,29 @@ components:
         limit:
           type: integer
           example: 20
-        offset:
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Opaque keyset cursor for the next page on
+            (created_at, id). Pass back as `?cursor=` to fetch the
+            next page. Absent (or null) on the final page. Issue #58.
+          example: eyJ2IjoxLCJwIjp7InRzIjoiMjAyNi0wNy0xNVQxMjozNDo1NloiLCJpZCI6NDJ9fQ
+        next_offset:
           type: integer
-          example: 0
+          nullable: true
+          deprecated: true
+          description: |
+            **Deprecated.** Legacy `LIMIT … OFFSET` arithmetic kept
+            for one compat release so the existing CLI's `--page`
+            math works against the new server. Use `next_cursor`
+            instead. Emitted ONLY on first-page responses (when
+            no `?cursor=` is supplied); cursor-driven pages omit
+            this because there's no well-defined offset once the
+            client has jumped forward in the cursor chain. Will be
+            removed in the next compat cycle — see #58-followup.
+            Issue #58.
+          example: 20
 
     ActivateResponse:
       type: object
@@ -2143,11 +2168,15 @@ paths:
             type: integer
             default: 50
             maximum: 500
-        - name: offset
+        - name: cursor
           in: query
           schema:
-            type: integer
-            default: 0
+            type: string
+          required: false
+          description: |
+            Opaque keyset cursor returned as `next_cursor` from a
+            prior `listApps` call. Pass it back to fetch the next
+            page. Absent (or empty string) means first page. Issue #58.
       responses:
         '200':
           description: Paginated list of apps.
@@ -2155,6 +2184,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
@@ -2403,11 +2434,30 @@ paths:
           schema:
             type: integer
             default: 20
+            maximum: 100
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          required: false
+          description: |
+            Opaque keyset cursor returned as `next_cursor` from a
+            prior `listDeployments` call. Pass it back to fetch the
+            next page of deployments ordered by (created_at DESC,
+            id DESC). Mutually exclusive with `?offset=` (400).
+            Issue #58.
         - name: offset
           in: query
           schema:
             type: integer
             default: 0
+          deprecated: true
+          description: |
+            **Deprecated.** Legacy `LIMIT … OFFSET` arithmetic.
+            Use `?cursor=` instead. Retained for one compat release
+            so the existing CLI's `--page` flag keeps working. Will
+            be removed in the next compat cycle — see #58-followup.
+            Issue #58.
       responses:
         '200':
           description: Paginated deployment list.
@@ -2415,6 +2465,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '500':
