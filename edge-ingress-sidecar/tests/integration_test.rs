@@ -27,7 +27,7 @@ use edge_ingress_sidecar::nats_sub::spawn_consumer;
 
 use edge_test_helpers::{should_skip_integration_tests, start_nats};
 
-/// Reconcilation grace window — how long the test waits for the
+/// Reconciliation grace window — how long the test waits for the
 /// aggregator to observe all replicas. Production has the same 1s
 /// window; tests give it 5× headroom because CI Docker cold-start
 /// inflates the wire latency past the production norm.
@@ -99,6 +99,20 @@ async fn three_replica_load_balances_to_per_replica_cap_one() {
         agg_tx,
         shutdown.clone(),
     );
+
+    // Wait for the consumer to attach its JetStream push subscription
+    // before publishing. With `RetentionPolicy::Interest` on the stream
+    // (`nats_pub::build_stream_config`), messages published before any
+    // consumer has them in its filter are GC'd immediately — so
+    // publishing too early in the test would deliver zero messages to
+    // the aggregator. `spawn_consumer` only spawns the task; the
+    // `consumer.messages()` round-trip (a JetStream RPC) is one tick
+    // away. A 1s settle gives the spawn task time to land the
+    // subscription before our first `publish_delta`. Production
+    // doesn't need this dance because the scrape tick is 1s and the
+    // consumer attaches during the sidecar's first boot, long before
+    // the first scrape — production has plenty of grace.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let aggregator = Aggregator::new(observer.to_string(), 10_000);
 
