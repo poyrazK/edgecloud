@@ -96,6 +96,32 @@ The host's `KvStore` writes the JSON store atomically via
 `rename-to-replace`, so a worker restart reopens the same dir and
 SETs from before the restart are still visible.
 
+Restart persistence is exercised **manually** via `redis-cli` against
+a real `edge deploy`. The wasmtime LR epoch model — 1 s budget for
+`start()` — prevents a full RESP round-trip in CI. The persistence
+test at
+`edge-worker/tests/redis_lite_e2e.rs::redis_lite_persists_kv_across_supervisor_restart`
+covers the same path in-process but is `#[ignore]`'d for the same
+reason, and additionally carries a doc-only caveat: the static
+`KV_STORES` cache at `edge-runtime/src/runtime.rs:80` lives for the
+process lifetime, so an in-process supervisor restart reuses the
+in-memory store unless a follow-up runtime-side escape hatch lands
+(filed separately). Run the manual test via
+`cargo test --manifest-path edge-worker/Cargo.toml --test redis_lite_e2e \
+   -- --ignored --nocapture`.
+
+## Security
+
+This sample has **no authentication**. Anyone with TCP reachability to
+the worker port can `SET`/`GET`/`DEL` keys. Do not expose a
+`redis-lite` deployment to the public internet without putting it
+behind a TLS-terminating proxy (e.g. `stunnel`, `caddy tls`) or
+forking the sample to add an `AUTH` command. The single-threaded
+accept loop also has no backpressure — a slow peer can starve other
+connections. The read-side and write-side bulk-string caps in
+`src/lib.rs::MAX_BULK_BYTES` (64 MiB) bound the per-frame memory
+footprint of a single misbehaving client.
+
 ## Why `EDGE_HTTP_SERVER_PORT`?
 
 The worker stamps the guest's private upstream port into
