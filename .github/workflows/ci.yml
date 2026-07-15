@@ -705,6 +705,20 @@ jobs:
         # regressions don't get dragged in.
         run: go test -tags=integration -v -count=1 ./internal/handler/... -run TestWorkerCP 2>&1 | tee -a test-logs.txt
 
+      - name: Run tenant first-deploy smoke test
+        # Issue #646: brand-new tenant -> owner API key -> free quota ->
+        # POST /api/v1/deploy/{appName} -> activation -> outbox fan-out
+        # -> running-app heartbeat -> POST /api/internal/tokens/tenant
+        # going from 403 (cold boot) to 200 (after running heartbeat).
+        # The cold-boot 403 and the post-heartbeat 200 are both
+        # asserted, plus an intermediate 403 after a capacity-only
+        # heartbeat to pin the seam. The test exposes the seam tracked
+        # by issue #642 (Worker JWT cold-boot window); it does NOT fix
+        # it. Depends on the WorkerKeyCache share (issue #713) having
+        # landed. See CLAUDE.md "First-deploy smoke test" for the
+        # deliberate scope.
+        run: go test -tags=integration -v -count=1 -run TestTenantFirstDeploy ./internal/integration/... 2>&1 | tee -a test-logs.txt
+
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v5
