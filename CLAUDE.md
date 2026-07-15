@@ -206,6 +206,21 @@ IDs are prefixed: tenants `t_`, deployments `d_`, API keys `k_`, workers `w_<reg
 5. Wasm stored at `/registry/{tenant_id}/{app_name}/{deployment_id}.wasm`; a `deployments` row is written with status `migrated` (no `active_deployments` row yet). Ed25519 signature over `(sha256_raw_32_bytes || deployment_id)` is persisted on the row.
 6. Response is returned: single-file mode returns `MigrationReport`; tree mode returns `TreeMigrationReport` with a per-file `FileReport` array (`{path, status, patterns_detected, transformations, manual_review, errors, preprocessor}`). The developer activates via `edge activate <id>`.
 
+### User-facing list pagination (issue #58)
+
+Both `GET /api/v1/apps` (issue #58 hard-cut) and `GET /api/v1/list/{appName}` (issue #58 dual-envelope compat release) paginate via opaque keyset cursors that round-trip as `?cursor=`. Wire format: base64url `{RawURLEncoding}` of `{"v":1,"p":<payload>}` envelopes. Per-resource payloads differ:
+
+- **`apps`** keyset on `name` — backed by `UNIQUE(tenant_id, name)` for strict total order (migration 004).
+- **`deployments`** strict-tuple keyset on `(created_at DESC, id DESC)` — backed by `idx_deployments_tenant_app_created_at_id_desc` (migration 036). Strict because deployments can share a second-precision `created_at` under load.
+
+Per-resource codec lives at `internal/service/{app,deployment}_pagination.go`; both delegate wire-format primitives (encode/decode/version/URL encoding) to `internal/httpx/pagination.go` so every list endpoint shares the same envelope. Ad-hoc codecs at `internal/service/{webhook_delivery,logs}_cursor.go` will migrate to that helper in a follow-up — out of scope here.
+
+**Compat release scope:** `?offset=` and `next_offset` on `/api/v1/list/{appName}` are kept behind `deprecated: true` (openapi precedent at lines 2740-2754) for one release so the existing `edge deployments --page N` math keeps working. Retire in #58-followup. `GET /api/v1/apps` is a hard-cut — there is no offset/compat layer.
+
+`?cursor=` and `?offset=` are mutually exclusive on the deployments endpoint (400), mirroring `handler/webhook.go:179-185` and the apps handler added in this issue.
+
+**Batch GC paths retain `LIMIT … OFFSET` as non-user-facing optimization** — these are tightly-bounded batch operations keyed on retention cutoffs (`DeleteOlderThanBatched`, `LogGC`, `AuditGC`, `PreviewGC`, `CacheRetrySweep`), not user-facing lists. Offset is fine here because the loop is server-internal and the row set doesn't shift under concurrent inserts the way a user-facing `LIMIT … OFFSET` page does.
+
 ## edge-runtime Deep Dive
 
 The runtime library is structured around the WIT world in `src/wit/edge-cloud.wit` (loaded at `src/lib.rs` via the bindgen! macro — two worlds, two submodules: `edge_runtime_long` and `edge_runtime_handler`). The macro generates Rust bindings at compile time.
