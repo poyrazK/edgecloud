@@ -384,6 +384,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deserializes_datagram_with_extra_unknown_field() {
+        // Forward-compat the other direction: the sidecar adds a new
+        // field (say `replica_build_id` for later debugging) and the
+        // ingress hasn't caught up yet. Serde's default behavior is to
+        // IGNORE unknown fields (rather than error) — pin that here so
+        // a future config flip to deny-unknown-keys would surface as a
+        // test failure across rolls, not a runtime panic on the wire.
+        // Pairs with [[cross-language-wire-test-drift-taxonomy]]: this
+        // catches the "drift in committed fixture" hazard for forward
+        // additions on the producer (sidecar) side.
+        let json = r#"{"configured":10000,"platform_total":2500,"replicas_seen":2,"local_cap":1500,"replica_build_id":"v0.2.0","ts_future_field":42}"#;
+        let p: DatagramPayload = serde_json::from_str(json).expect("parse");
+        assert_eq!(p.configured, 10_000);
+        assert_eq!(p.platform_total, 2_500);
+        assert_eq!(p.replicas_seen, 2);
+        assert_eq!(p.local_cap, Some(1_500));
+    }
+
+    #[tokio::test]
     async fn reader_binds_socket_and_chmods() {
         // End-to-end UDS roundtrip (the production semantic): the
         // reader binds, an unbound sender `send_to`s, the cache
