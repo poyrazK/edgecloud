@@ -39,7 +39,11 @@ ENV CARGO_BUILD_RUSTC_WRAPPER="" \
 
 WORKDIR /workspace
 
-COPY Cargo.toml Cargo.lock ./
+# Cargo.lock is NOT COPY'd from the build context (the workspace
+# gitignores it). Generate it inside the builder stage via
+# `cargo generate-lockfile` below; see edge-control-plane/Dockerfile
+# for the full rationale.
+COPY Cargo.toml ./
 COPY edge-runtime/Cargo.toml                          edge-runtime/Cargo.toml
 COPY edge-config/Cargo.toml                           edge-config/Cargo.toml
 COPY edge-spool/Cargo.toml                            edge-spool/Cargo.toml
@@ -61,6 +65,7 @@ RUN mkdir -p \
     echo "" > edge-ingress/src/main.rs && \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
+    cargo generate-lockfile && \
     cargo fetch --locked
 
 # ── Stage 1b: actual build ─────────────────────────────────────────
@@ -75,7 +80,12 @@ WORKDIR /workspace
 
 COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 
-COPY Cargo.toml Cargo.lock ./
+# Cargo.lock is NOT COPY'd from the build context (the workspace
+# gitignores it); the deps stage above generated one via
+# `cargo generate-lockfile`. `cargo build --release` regenerates it
+# on the fly from the manifests + cached registry, which is fine
+# because the registry is already deterministic.
+COPY Cargo.toml ./
 COPY edge-runtime/   edge-runtime/
 COPY edge-config/    edge-config/
 COPY edge-spool/     edge-spool/

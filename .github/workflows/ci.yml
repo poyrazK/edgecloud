@@ -299,6 +299,14 @@ jobs:
       # Cargo registry cache. Cross-invocation reuse of compiled
       # deps is the largest wall-clock win — first cargo build
       # pays ~10 min for wasmtime; subsequent runs hit this cache.
+      #
+      # Note: we key on `**/Cargo.toml` instead of `**/Cargo.lock`
+      # because the workspace gitignores `Cargo.lock` (it's a mix of
+      # libraries and binaries; the lockfile is intentionally not
+      # committed). The Dockerfile generates it inside the builder
+      # stage via `cargo generate-lockfile`, so the runtime build is
+      # not blocked. Cargo.toml-set changes invalidate the cache,
+      # which is what we actually want.
       - name: Cache cargo registry
         uses: actions/cache@v5
         with:
@@ -306,7 +314,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-build-images-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-build-images-cargo-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-build-images-cargo-
 

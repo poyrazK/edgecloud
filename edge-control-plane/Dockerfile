@@ -80,7 +80,17 @@ WORKDIR /workspace
 
 # Vendor Cargo manifests first so the cache layer invalidates only on
 # workspace dependency changes, not on every source edit.
-COPY Cargo.toml Cargo.lock ./
+#
+# `Cargo.lock` is intentionally NOT COPY'd from the build context —
+# it's in .gitignore (the workspace is a mix of libraries and binaries;
+# gitignore-the-lockfile is the conservative choice). On a fresh CI
+# clone, the build context has no `Cargo.lock`, and `cargo fetch
+# --locked` requires one. Generate it inside the builder stage from
+# the freshly-COPY'd Cargo.toml set instead. This keeps the lockfile
+# generation cost inside the BuildKit cache layer (keyed off
+# `Cargo.toml` content), so a subsequent rebuild that hasn't touched
+# any manifest skips the regeneration.
+COPY Cargo.toml ./
 COPY edge-runtime/Cargo.toml                  edge-runtime/Cargo.toml
 COPY edge-runtime/bin/wasm2cwasm/Cargo.toml   edge-runtime/bin/wasm2cwasm/Cargo.toml
 COPY edge-config/Cargo.toml                   edge-config/Cargo.toml
@@ -90,6 +100,12 @@ COPY edge-migrate/edge-migrate-bin/Cargo.toml edge-migrate/edge-migrate-bin/Carg
 # Pre-fetch deps (separate RUN so the cache layer is keyed off Cargo.lock
 # only). The empty-stub src/lib.rs files let cargo resolve the package
 # graph without paying the bandwidth for actual sources.
+#
+# Two-step: first generate Cargo.lock from the manifests just COPY'd
+# in (since the build context doesn't carry one — see the comment on
+# the COPY block above). Then `cargo fetch --locked` validates the
+# freshly-generated lockfile against the manifest set and pre-fetches
+# every registry entry to the cache mount.
 RUN mkdir -p \
       edge-migrate/edge-migrate-lib/src \
       edge-migrate/edge-migrate-bin/src && \
@@ -98,6 +114,7 @@ RUN mkdir -p \
     echo "" > edge-runtime/bin/wasm2cwasm/src/main.rs && \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
+    cargo generate-lockfile && \
     cargo fetch --locked
 
 # Now copy the real sources and build both bins unconditionally.

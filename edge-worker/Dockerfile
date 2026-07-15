@@ -40,7 +40,12 @@ WORKDIR /workspace
 # We narrow the COPY to the manifests + a stub src/lib.rs+main.rs per
 # crate so `cargo fetch --locked` resolves the package graph without
 # pulling sources the worker doesn't use at runtime.
-COPY Cargo.toml Cargo.lock ./
+#
+# `Cargo.lock` is NOT COPY'd from the build context (the workspace
+# gitignores it). Generate it inside the builder stage from the
+# freshly-COPY'd Cargo.toml set; see edge-control-plane/Dockerfile
+# for the full rationale.
+COPY Cargo.toml ./
 COPY edge-runtime/Cargo.toml                          edge-runtime/Cargo.toml
 COPY edge-config/Cargo.toml                           edge-config/Cargo.toml
 COPY edge-spool/Cargo.toml                            edge-spool/Cargo.toml
@@ -68,6 +73,7 @@ RUN mkdir -p \
     echo "" > edge-ingress/src/main.rs && \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
+    cargo generate-lockfile && \
     cargo fetch --locked
 
 # ── Stage 1b: actual build ─────────────────────────────────────────
@@ -89,7 +95,15 @@ COPY --from=deps /usr/local/cargo/registry /usr/local/cargo/registry
 # Source slices the worker needs. Each is its own COPY so a change
 # in `edge-worker/src/` does NOT bust the layer for `edge-runtime/`
 # (which dominates the build time).
-COPY Cargo.toml Cargo.lock ./
+#
+# Cargo.lock is intentionally NOT COPY'd from the build context (the
+# workspace gitignores it). The deps stage above generated one via
+# `cargo generate-lockfile` and the registry cache mount preserves it
+# in /usr/local/cargo/registry; `cargo build --release` regenerates
+# /workspace/Cargo.lock on the fly from the manifests and the cached
+# registry index, which is fine because the registry is already
+# deterministic.
+COPY Cargo.toml ./
 COPY edge-runtime/   edge-runtime/
 COPY edge-config/    edge-config/
 COPY edge-spool/     edge-spool/
