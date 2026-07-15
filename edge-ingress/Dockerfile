@@ -55,6 +55,7 @@ COPY edge-migrate/edge-migrate-lib/Cargo.toml         edge-migrate/edge-migrate-
 COPY edge-migrate/edge-migrate-bin/Cargo.toml         edge-migrate/edge-migrate-bin/Cargo.toml
 COPY edge-js-runtime/Cargo.toml                       edge-js-runtime/Cargo.toml
 COPY edge-js-runtime-long/Cargo.toml                  edge-js-runtime-long/Cargo.toml
+COPY edge-test-helpers/Cargo.toml                     edge-test-helpers/Cargo.toml
 
 RUN mkdir -p \
       edge-runtime/src \
@@ -67,7 +68,8 @@ RUN mkdir -p \
       edge-migrate/edge-migrate-lib/src \
       edge-migrate/edge-migrate-bin/src \
       edge-js-runtime/src \
-      edge-js-runtime-long/src && \
+      edge-js-runtime-long/src \
+      edge-test-helpers/src && \
     echo "" > edge-runtime/src/lib.rs && \
     echo "" > edge-runtime/bin/wasm2cwasm/src/main.rs && \
     echo "" > edge-config/src/lib.rs && \
@@ -80,7 +82,8 @@ RUN mkdir -p \
     echo "" > edge-migrate/edge-migrate-lib/src/lib.rs && \
     echo "" > edge-migrate/edge-migrate-bin/src/main.rs && \
     echo "" > edge-js-runtime/src/lib.rs && \
-    echo "" > edge-js-runtime-long/src/lib.rs
+    echo "" > edge-js-runtime-long/src/lib.rs && \
+    echo "" > edge-test-helpers/src/lib.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
