@@ -206,59 +206,68 @@ jobs:
   # the vendored file is genuinely the canonical source).
   # ============================================================
   caddy-image:
-    # Issue #663 — build the custom Caddy image that bundles the
-    # first-party tenant_concurrent HTTP middleware (enforcement
-    # half of sub-feature #2 of #305). Stock `caddy:2` has no
-    # in-flight concurrency counter primitive; the image is what
-    # actually enforces the per-tenant concurrent-request cap at
-    # the route layer. See edge-ingress/Dockerfile.caddy-concurrent
-    # and caddy-modules/tenant_concurrent/.
-    name: caddy-image (issue #663)
+    # Issues #663 + #664 — build the custom Caddy image that
+    # bundles the first-party tenant_concurrent (#663, sub-feature
+    # #2 of #305) and tenant_bandwidth (#664, sub-feature #3) HTTP
+    # middlewares. Stock `caddy:2` has no in-flight concurrency
+    # counter primitive and no response-payload byte-rate throttle
+    # (caddyserver/caddy#4476 closed as not-planned); the image is
+    # what actually enforces both per-tenant caps at the route
+    # layer. See edge-ingress/Dockerfile.caddy-concurrent and
+    # caddy-modules/tenant_concurrent/, caddy-modules/tenant_bandwidth/.
+    name: caddy-image (issues #663 + #664)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
       - name: Set up Go
         # The Dockerfile runs `xcaddy build`, which shells out to
-        # `go build` to compile the tenant_concurrent plugin into
-        # the Caddy binary. caddy-modules/tenant_concurrent/go.mod
-        # pins go 1.25.0; xcaddy uses the on-PATH toolchain, so the
+        # `go build` to compile the tenant_concurrent + tenant_bandwidth
+        # plugins into the Caddy binary. Both modules' go.mod pin
+        # go 1.25.0; xcaddy uses the on-PATH toolchain, so the
         # runner's go must match (setup-go@v6 hard-sets
         # GOTOOLCHAIN=local — same as the openapi-validate job).
         uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
 
-      - name: Build Caddy image with tenant_concurrent module
+      - name: Build Caddy image with first-party modules
         # Build context is the repo root (note the trailing `.`)
         # because xcaddy's local-path form
-        # `--with ...=./caddy-modules/tenant_concurrent` resolves
-        # relative to the build context. The Dockerfile
+        # `--with ...=./caddy-modules/<name>` resolves relative to
+        # the build context. The Dockerfile
         # `COPY caddy-modules/ /usr/bin/caddy-modules/` is required
         # because xcaddy's CWD inside `caddy:2-builder` is
         # `/usr/bin/`; without the COPY the local-path form would
-        # resolve to `/usr/bin/caddy-modules/tenant_concurrent` and
-        # the build would fail with `replacement directory does
-        # not exist`. Once the repo publishes tagged releases of
-        # edgecloud-caddy-modules/tenant_concurrent, switch
-        # `--with` to the GitHub ref form and drop the COPY.
+        # resolve to `/usr/bin/caddy-modules/<name>` and the build
+        # would fail with `replacement directory does not exist`.
+        # Once the repo publishes tagged releases of
+        # edgecloud-caddy-modules/tenant_{concurrent,bandwidth},
+        # switch `--with` to the GitHub ref form and drop the COPY.
         run: |
           docker build \
             -t edgecloud/caddy-concurrent:test \
             -f edge-ingress/Dockerfile.caddy-concurrent \
             .
 
-      - name: Smoke test — module registers in Caddy
+      - name: Smoke test — modules register in Caddy
         # `caddy list-modules` is the standard way to confirm a
         # custom HTTP handler compiled into the binary. The grep
         # pin catches both "module missing" (compile failure) and
-        # "wrong module ID" (registration failure). No docker push
-        # here — production image publishing is operator infra,
-        # not in this PR's scope.
+        # "wrong module ID" (registration failure — see
+        # memory/issue-663-caddy-module-init-gotcha: missing
+        # `init() { caddy.RegisterModule(...) }` makes the build
+        # succeed silently while the module ID never lands in
+        # caddy.Modules()). One grep per module — both must hit.
+        # No docker push here — production image publishing is
+        # operator infra, not in this PR's scope.
         run: |
           docker run --rm edgecloud/caddy-concurrent:test \
             caddy list-modules --packages http.handlers \
             | grep tenant_concurrent
+          docker run --rm edgecloud/caddy-concurrent:test \
+            caddy list-modules --packages http.handlers \
+            | grep tenant_bandwidth
 
   rust-js-build:
     runs-on: ubuntu-latest
