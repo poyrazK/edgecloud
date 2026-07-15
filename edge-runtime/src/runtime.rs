@@ -312,6 +312,19 @@ impl RuntimeState {
             env.insert("EDGE_PREVIEW_PR_NUMBER".to_string(), pr.to_string());
         }
 
+        // Defense in depth (issue #620): the worker boundary at
+        // edge-worker/src/supervisor.rs is the canonical gate
+        // (`is_safe_tenant_id` at `start_app` and `handle_purge`). A
+        // future caller that bypasses the worker — FaaS shell test,
+        // ad-hoc binary, future HTTP entry point — must not silently
+        // escape the per-tenant root via `Path::join`. Panics in
+        // `cargo test`; compiles to nothing in `--release`.
+        debug_assert!(
+            crate::interfaces::is_safe_tenant_id(&tenant_id),
+            "RuntimeState::with_env_and_meter received unsafe tenant_id {tenant_id:?}; \
+             the worker boundary at edge-worker/src/supervisor.rs is the canonical gate"
+        );
+
         // Compose the store key. For non-preview deploys the key is
         // just `{tenant_id}` — identical to the pre-#308 behavior, so
         // existing on-disk store blobs continue to be picked up
