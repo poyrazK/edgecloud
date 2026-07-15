@@ -146,3 +146,57 @@ async fn activate_server_error_does_not_overwrite_state() {
         "state.json must not be updated on a failed activate"
     );
 }
+
+/// Pre-flight path-component validation on `edge activate <deploy_id>`
+/// (reads `app_name` from state.json) and `edge deploy --promote
+/// <deploy_id>` (reads `app_name` from --app or state.json).
+///
+/// Both interpolate `app_name` AND `deployment_id` into the URL path —
+/// `POST /api/v1/apps/{app}/activate/{deploy}` and
+/// `POST /api/v1/apps/{app}/promote/{deploy}`. Issue #671.
+#[tokio::test]
+async fn activate_and_promote_reject_invalid_app_or_deployment() {
+    for (verb_args, expected_substr) in [
+        // activate: bad deployment_id (app_name comes from state.json)
+        (vec!["activate", "d_../bad"], "'..'"),
+        (vec!["activate", "d_bad%2Fid"], "invalid character"),
+        // activate: bad deployment_id (empty)
+        (vec!["activate", ""], "cannot be empty"),
+        // promote: bad app_name (positional APP overrides state.json)
+        (
+            vec!["deploy", "my../api", "--promote", "d_good_001"],
+            "'..'",
+        ),
+        (
+            vec!["deploy", "my%2Fapi", "--promote", "d_good_001"],
+            "invalid character",
+        ),
+        // promote: bad deployment_id
+        (vec!["deploy", "api", "--promote", "d_..bad"], "'..'"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+        // state.json seeds `app_name = "myapp"` so activate resolves
+        // to a known good app name and the validator surfaces the
+        // bad `deployment_id` (not the absent app_name).
+        seed_project(&project, "myapp", "d_seed");
+
+        // Fence: NO POST on /api/v1/apps/<id>/{activate,promote} may ever land.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.args(&verb_args);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

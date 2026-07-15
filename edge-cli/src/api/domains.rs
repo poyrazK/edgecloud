@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::client::check_response;
+use super::path::validate_path_component;
 
 /// One row of the `domains` table as seen by the tenant. Mirrors the
 /// Go `domain.Domain` struct field-for-field. The `verified_at` and
@@ -63,6 +64,8 @@ pub struct DomainClient<'a> {
 impl<'a> DomainClient<'a> {
     /// Bind a custom FQDN to an existing app. Returns the new row.
     pub fn add(&self, app: &str, fqdn: &str) -> Result<Domain> {
+        validate_path_component("app_name", app)?;
+        validate_path_component("fqdn", fqdn)?;
         let url = format!("{}/api/v1/apps/{}/domains", self.client.base_url(), app);
         let resp = self
             .client
@@ -78,6 +81,7 @@ impl<'a> DomainClient<'a> {
 
     /// List all custom FQDNs bound to the app.
     pub fn list(&self, app: &str) -> Result<Vec<Domain>> {
+        validate_path_component("app_name", app)?;
         let url = format!("{}/api/v1/apps/{}/domains", self.client.base_url(), app);
         let resp = self
             .client
@@ -95,6 +99,8 @@ impl<'a> DomainClient<'a> {
 
     /// Fetch a single row by (app, fqdn).
     pub fn get(&self, app: &str, fqdn: &str) -> Result<Domain> {
+        validate_path_component("app_name", app)?;
+        validate_path_component("fqdn", fqdn)?;
         let url = format!(
             "{}/api/v1/apps/{}/domains/{}",
             self.client.base_url(),
@@ -114,6 +120,8 @@ impl<'a> DomainClient<'a> {
 
     /// Unbind a custom FQDN from an app.
     pub fn remove(&self, app: &str, fqdn: &str) -> Result<()> {
+        validate_path_component("app_name", app)?;
+        validate_path_component("fqdn", fqdn)?;
         let url = format!(
             "{}/api/v1/apps/{}/domains/{}",
             self.client.base_url(),

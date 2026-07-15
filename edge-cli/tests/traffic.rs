@@ -197,3 +197,78 @@ async fn traffic_show_happy_path() {
         .stdout(predicate::str::contains("20%"))
         .stdout(predicate::str::contains("d_v2"));
 }
+
+/// Pre-flight path-component validation on `edge traffic show` and
+/// `edge traffic set`. Both interpolate `app_name` (sourced from
+/// `.edge/state.json`) into `GET /api/v1/apps/{app}/traffic` and
+/// `PUT /api/v1/apps/{app}/traffic`. We seed state.json with a
+/// hostile app_name so the validator surfaces the bad id. Issue #671.
+#[tokio::test]
+async fn traffic_get_and_set_reject_invalid_app_name() {
+    for (verb_args, expected_substr, verb) in [
+        // traffic show: hostile app_name from state.json
+        (vec!["traffic", "show"], "'..'", "GET"),
+        (vec!["traffic", "show"], "invalid character", "GET"),
+        // traffic set: hostile app_name from state.json
+        (vec!["traffic", "set", "d_v1=80", "d_v2=20"], "'..'", "PUT"),
+        (
+            vec!["traffic", "set", "d_v1=80", "d_v2=20"],
+            "invalid character",
+            "PUT",
+        ),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // edge.toml + state.json are required by `edge traffic show`
+        // / `edge traffic set`. We seed both; the hostile app_name
+        // lives in state.json so the validator (which runs AFTER the
+        // state load) actually gets to fire. The validator's
+        // expected stderr substring tells us which hostile name
+        // was loaded (one per `expected_substr`).
+        let bad_app = if expected_substr == "'..'" {
+            "my../api"
+        } else {
+            "my%2Fapi"
+        };
+        std::fs::write(
+            project.path().join("edge.toml"),
+            r#"[project]
+name = "traffictest"
+version = "0.1.0"
+target = "wasm32-wasip2"
+world = "edge-runtime-handler"
+
+[deployment]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join(".edge")).unwrap();
+        std::fs::write(
+            project.path().join(".edge").join("state.json"),
+            format!(
+                r#"{{"deployment_id":"d_seed","app_name":"{}","live_url":""}}"#,
+                bad_app
+            ),
+        )
+        .unwrap();
+
+        // Fence: NO GET/PUT on /api/v1/apps/<id>/traffic may ever land.
+        Mock::given(method(verb))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.current_dir(project.path());
+        cmd.args(&verb_args);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

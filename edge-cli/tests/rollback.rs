@@ -277,3 +277,37 @@ world = "edge-runtime-handler"
         .failure()
         .stderr(predicate::str::contains("requires an app name"));
 }
+
+/// Pre-flight path-component validation on `edge rollback <app>`.
+/// The `app_name` interpolates into `POST /api/v1/apps/{app}/rollback`.
+/// Issue #671.
+#[tokio::test]
+async fn rollback_rejects_invalid_app_name() {
+    for (bad_name, expected_substr) in [("my../api", "'..'"), ("my%2Fapi", "invalid character")] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+        // edge.toml + state.json are required by `edge rollback` to
+        // resolve an [deployment] api= URL. We seed both so the
+        // path-component validator (which runs AFTER the toml parse)
+        // actually gets to fire.
+        seed_project(&project, "myapp", "d_seed");
+
+        // Fence: NO POST on /api/v1/apps/<id>/rollback may ever land.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.current_dir(project.path());
+        cmd.arg("rollback").arg(bad_name);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

@@ -879,3 +879,117 @@ impl Match for QueryParamAbsentMatcher {
         !req.url.query_pairs().any(|(k, _)| k == self.0)
     }
 }
+
+/// Pre-flight path-component validation: malformed `webhook_id`
+/// values must bail with an actionable error before any DELETE
+/// round-trip lands. Three sub-cases mirror the destructive-endpoint
+/// suite. Issue #671.
+#[tokio::test]
+async fn webhooks_remove_rejects_invalid_webhook_id() {
+    for (bad_id, expected_substr) in [
+        ("wh_..bad", "'..'"),
+        ("wh_%2Fbad", "invalid character"),
+        ("", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO DELETE may ever land. The validator must fire
+        // before any round-trip to /api/v1/webhooks/{id}.
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri())
+            .arg("webhooks")
+            .arg("remove")
+            .arg(bad_id);
+
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_substr));
+    }
+}
+
+/// Pre-flight path-component validation: malformed `webhook_id`
+/// values must bail with an actionable error before any PUT
+/// round-trip lands. `edge webhooks update <id> ...` interpolates
+/// `id` into `PUT /api/v1/webhooks/{id}`. Issue #671.
+#[tokio::test]
+async fn webhooks_update_rejects_invalid_webhook_id() {
+    for (bad_id, expected_substr) in [
+        ("wh_..bad", "'..'"),
+        ("wh_%2Fbad", "invalid character"),
+        ("", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO PUT may ever land.
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri())
+            .arg("webhooks")
+            .arg("update")
+            .arg(bad_id);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}
+
+/// Pre-flight path-component validation: malformed `webhook_id`
+/// values must bail with an actionable error before any GET on
+/// `/api/v1/webhooks/{id}/deliveries` round-trip lands.
+/// Issue #671.
+#[tokio::test]
+async fn webhooks_deliveries_rejects_invalid_webhook_id() {
+    for (bad_id, expected_substr) in [
+        ("wh_..bad", "'..'"),
+        ("wh_%2Fbad", "invalid character"),
+        ("", "cannot be empty"),
+    ] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        write_minimal_edge_toml(&project);
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+
+        // Fence: NO GET may ever land.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri())
+            .arg("webhooks")
+            .arg("deliveries")
+            .arg(bad_id);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

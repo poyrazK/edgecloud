@@ -597,3 +597,40 @@ async fn deploy_retry_preserves_user_supplied_idempotency_key() {
         );
     }
 }
+
+/// Pre-flight path-component validation on `edge deploy`. The
+/// `app_name` is interpolated into `POST /api/v1/deploy/{app_name}`;
+/// the validator must fire before any round-trip. Issue #671.
+#[tokio::test]
+async fn deploy_rejects_invalid_app_name() {
+    for (bad_name, expected_substr) in [("my../api", "'..'"), ("my%2Fapi", "invalid character")] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+        // edge.toml + a stub artifact are required by `edge deploy`.
+        // We seed them so the path-component validator (which runs
+        // AFTER the toml parse) actually gets to fire. We don't need
+        // the wasm to be valid — the validator must bail BEFORE any
+        // upload attempt.
+        seed_project(&project, "myapp");
+
+        // Fence: NO POST on /api/v1/deploy/<id> may ever land.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.current_dir(project.path());
+        cmd.env("EDGE_API_URL", server.uri());
+        // `[APP]` is positional on `edge deploy` — it overrides the
+        // `[project].name` from edge.toml.
+        cmd.arg("deploy").arg(bad_name);
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}

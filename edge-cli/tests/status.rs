@@ -342,6 +342,64 @@ async fn status_runtime_propagates_404_with_flattened_error() {
 // the legacy DB-row view when nesting under `Status`.
 // ---------------------------------------------------------------------------
 
+/// Pre-flight path-component validation on `edge status deployment`.
+/// The `deployment_id` interpolates into
+/// `GET /api/v1/status/{deployment_id}`. It's loaded from state.json,
+/// so the user-controlled surface is small (writing state.json with a
+/// bad deployment_id), but we still pin the validator because future
+/// state.json migrations could let a bad value through. Issue #671.
+#[tokio::test]
+async fn status_deployment_rejects_invalid_deployment_id_from_state() {
+    for (bad_id, expected_substr) in [("d_../bad", "'..'"), ("d_bad%2Fid", "invalid character")] {
+        let home = common::isolated_home();
+        let project = common::isolated_home();
+        let server = MockServer::start().await;
+
+        common::seed_api_key(&home, "k_seed");
+        // Write state.json with a hostile deployment_id. This isn't
+        // a realistic attack (state.json is local), but we want to
+        // pin the validator so a future change doesn't silently
+        // forward a bad id to the wire.
+        std::fs::write(
+            project.path().join("edge.toml"),
+            r#"[project]
+name = "myapp"
+version = "0.1.0"
+target = "wasm32-wasip2"
+world = "edge-runtime-handler"
+
+[deployment]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join(".edge")).unwrap();
+        std::fs::write(
+            project.path().join(".edge").join("state.json"),
+            format!(
+                r#"{{"deployment_id":"{}","app_name":"myapp","live_url":""}}"#,
+                bad_id
+            ),
+        )
+        .unwrap();
+
+        // Fence: NO GET on /api/v1/status/<id> may ever land.
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut cmd = Command::cargo_bin("edge").unwrap();
+        common::set_platform_env(&mut cmd, &home);
+        cmd.env("EDGE_API_URL", server.uri());
+        cmd.current_dir(project.path());
+        cmd.arg("status");
+        cmd.arg("deployment");
+
+        common::assert_invalid_path_component(cmd, expected_substr);
+    }
+}
+
 #[tokio::test]
 async fn status_deployment_still_works() {
     let home = common::isolated_home();
