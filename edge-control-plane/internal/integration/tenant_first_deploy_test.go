@@ -272,7 +272,7 @@ func TestTenantFirstDeploy(t *testing.T) {
 
 	// Step 16 — outbox row flipped to published.
 	t.Log("outbox row published")
-	firstDeployEventuallyOutboxPublished(t, ctx, db, deploymentID)
+	firstDeployEventuallyOutboxPublished(t, ctx, db, tenantID, firstDeployAppName)
 
 	// Step 17 — publish a running heartbeat for the deployed app.
 	t.Log("publishing running heartbeat")
@@ -900,11 +900,13 @@ func firstDeployAssertFirstDeployRows(
 	`, tenantID, appName).Scan(&adCount))
 	require.Zero(t, adCount, "active_deployments row must NOT exist post-deploy (only after activate)")
 
-	// No outbox row yet.
+	// No outbox row yet. dedupe_key is `tenantID:appName:<uuid>` per
+	// attempt (deployment.go:1677), so query by (tenant_id, app_name).
 	var outboxCount int
 	require.NoError(t, db.QueryRowxContext(ctx, `
-		SELECT COUNT(*) FROM outbox WHERE dedupe_key = $1
-	`, deploymentID).Scan(&outboxCount))
+		SELECT COUNT(*) FROM outbox
+		WHERE tenant_id = $1 AND app_name = $2
+	`, tenantID, appName).Scan(&outboxCount))
 	require.Zero(t, outboxCount, "outbox row must NOT exist post-deploy (only after activate)")
 }
 
@@ -927,18 +929,23 @@ func firstDeployAssertActivationCommitted(
 	require.Equal(t, deploymentID, adID,
 		"active_deployments.deployment_id must equal the just-activated id")
 
-	// Pending outbox row.
+	// Pending outbox row. The deployment service stamps dedupe_key as
+	// `tenantID:appName:<fresh-uuid>` per attempt (deployment.go:1677),
+	// so search by (tenant_id, app_name) instead of by dedupe_key.
 	var (
-		kind     string
-		status   string
-		payload  []byte
+		kind    string
+		dbState string
+		payload []byte
 	)
 	require.NoError(t, db.QueryRowxContext(ctx, `
 		SELECT kind, status, payload
-		FROM outbox WHERE dedupe_key = $1
-	`, deploymentID).Scan(&kind, &status, &payload))
+		FROM outbox
+		WHERE tenant_id = $1 AND app_name = $2
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, tenantID, appName).Scan(&kind, &dbState, &payload))
 	require.Equal(t, "task_update", kind, "outbox row kind must be task_update")
-	require.Equal(t, "pending", status,
+	require.Equal(t, "pending", dbState,
 		"outbox row status must be pending (drainer not yet started)")
 
 	// Decode the payload and assert the wire shape mirrors what the
@@ -984,19 +991,23 @@ func firstDeployStartDrainer(
 // firstDeployEventuallyOutboxPublished polls the outbox row's status
 // until it flips to 'published' or 5s elapses.
 func firstDeployEventuallyOutboxPublished(
-	t *testing.T, ctx context.Context, db *sqlx.DB, dedupeKey string,
+	t *testing.T, ctx context.Context, db *sqlx.DB, tenantID, appName string,
 ) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		var status string
-		err := db.QueryRowxContext(ctx,
-			`SELECT status FROM outbox WHERE dedupe_key = $1`, dedupeKey).Scan(&status)
+		err := db.QueryRowxContext(ctx, `
+			SELECT status FROM outbox
+			WHERE tenant_id = $1 AND app_name = $2
+			ORDER BY created_at DESC
+			LIMIT 1
+		`, tenantID, appName).Scan(&status)
 		if err != nil {
 			return false
 		}
 		return status == "published"
 	}, 5*time.Second, 50*time.Millisecond,
-		"outbox row for dedupe_key=%s never flipped to published", dedupeKey)
+		"outbox row for tenant=%s app=%s never flipped to published", tenantID, appName)
 }
 
 // newIdempotencyKey returns a fresh UUID-v4-shaped hex string. The
