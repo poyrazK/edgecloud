@@ -192,7 +192,7 @@ func TestTenantFirstDeploy(t *testing.T) {
 	// Step 5 — fake worker: insert row + enrolled Ed25519 public key.
 	// No worker_status row yet — that IS the cold-boot state.
 	t.Log("inserting fake worker")
-	pubKey, workerJWT := firstDeployNewFakeWorker(t, ctx, db, workerRepo)
+	pubKey, workerJWT := firstDeployNewFakeWorker(t, ctx, db, workerRepo, tenantID)
 
 	// Step 6 — first POST /api/internal/tokens/tenant → 403 cold boot.
 	t.Log("tenant token (cold) -> checking")
@@ -637,6 +637,7 @@ func firstDeployAssertFreshTenantRows(
 func firstDeployNewFakeWorker(
 	t *testing.T, ctx context.Context, db *sqlx.DB,
 	workerRepo *repository.WorkerRepository,
+	tenantID string,
 ) (string, string) {
 	t.Helper()
 
@@ -644,14 +645,15 @@ func firstDeployNewFakeWorker(
 	require.NoError(t, err)
 	pubHex := hex.EncodeToString(pub)
 
-	// workers row: tenant_id is NOT NULL FK to tenants — use "*"
-	// (wildcard). The workers table allows the wildcard; the
-	// production bootstrap inserts tenant_id="*" too.
+	// workers row: tenant_id has a FK to tenants(id) per migration 003,
+	// so it MUST be a real tenant — use the freshly-bootstrapped tenant
+	// for this test. Production bootstrap inserts a per-worker tenant
+	// token (`tenant_id="*"` lives in the JWT claim, not the FK column).
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO workers (id, region, tenant_id, memory_mb)
-		VALUES ($1, $2, '*', 4096)
+		VALUES ($1, $2, $3, 4096)
 		ON CONFLICT (id) DO NOTHING
-	`, firstDeployWorkerID, firstDeployRegion)
+	`, firstDeployWorkerID, firstDeployRegion, tenantID)
 	require.NoError(t, err)
 
 	// Set the public key via the production repository helper so the
