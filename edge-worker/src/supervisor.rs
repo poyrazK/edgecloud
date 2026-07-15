@@ -3181,7 +3181,7 @@ impl Supervisor {
                     app_name.to_string(),
                     current_deployment_id.to_string(),
                 );
-                let mut s = state.write().await;
+                let s = state.write().await;
                 s.apps.get(&crash_key).cloned()
             };
             if let Some(inst_arc) = inst_arc {
@@ -3245,7 +3245,7 @@ impl Supervisor {
                         app_name.to_string(),
                         current_deployment_id.to_string(),
                     );
-                    let mut s = state.write().await;
+                    let s = state.write().await;
                     s.apps.get(&crash_key).cloned()
                 };
                 if let Some(inst_arc) = inst_arc {
