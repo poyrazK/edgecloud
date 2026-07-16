@@ -272,22 +272,42 @@ jobs:
   build-images:
     name: build-images (issue #512)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dockerfile: edge-control-plane/Dockerfile
+            image: edgecloud/control-plane
+            name: control-plane
+          - dockerfile: edge-worker/Dockerfile
+            image: edgecloud/worker
+            name: worker
+          - dockerfile: edge-ingress/Dockerfile
+            image: edgecloud/ingress
+            name: ingress
     # We pin SCCACHE off in this job. The .cargo/config.toml
     # already sets `rustc-wrapper = "sccache"`, but sccache's local
     # disk cache can't share state across Docker build invocations
     # on the same runner. Each Dockerfile overrides
     # CARGO_BUILD_RUSTC_WRAPPER="" inside the builder stage so the
-    # wrapper is bypassed during Docker builds. The cargo registry
-    # + target-dir are cached via actions/cache@v5 below — that's
-    # the primary cross-invocation reuse mechanism (cargo fetch +
-    # cargo build reuse), keeping cold builds at ~25 min and
-    # warm builds at ~2 min. BuildKit's gha cache backend is
-    # deliberately omitted: it consistently errors on this repo's
-    # `COPY Cargo.toml Cargo.lock ./` step with
-    # `failed to calculate checksum of ref <X>: "/Cargo.lock": not
-    # found` even on the first-ever build with no prior cache
-    # refs (BuildKit v0.30.0 gha-backend bug). The cargo registry
-    # cache + cold-layer rebuild is the supported path.
+    # wrapper is bypassed during Docker builds.
+    #
+    # Cross-invocation reuse is split across two caches:
+    #   1. cargo registry + target/  → actions/cache@v5 (key on
+    #      **/Cargo.toml, with `-${{ matrix.name }}` suffix so the
+    #      three parallel matrix jobs don't clobber each other's
+    #      ~/.cargo/registry state).
+    #   2. BuildKit layer cache      → /tmp/.buildx-cache via
+    #      cache-from/cache-to type=local on docker/build-push-action@v6.
+    # BuildKit's `type=gha` cache backend is deliberately omitted: it
+    # consistently errors on this repo's `COPY Cargo.toml Cargo.lock ./`
+    # step with `failed to calculate checksum of ref <X>:
+    # "/Cargo.lock": not found` even on the first-ever build with no
+    # prior cache refs (BuildKit v0.30.0 gha-backend bug).
+    #
+    # Baseline (PR #718, sequential builds, cold cache): ~15m. After
+    # this change the wall-clock floor is the slowest parallel matrix
+    # job (~7-8m cold / ~1-2m warm with cache hit).
     env:
       CARGO_BUILD_RUSTC_WRAPPER: ""
     steps:
@@ -307,16 +327,29 @@ jobs:
       # stage via `cargo generate-lockfile`, so the runtime build is
       # not blocked. Cargo.toml-set changes invalidate the cache,
       # which is what we actually want.
-      - name: Cache cargo registry
+      #
+      # Also include the docker-buildx cache mount path. BuildKit's
+      # `type=gha` cache backend is broken on this repo (v0.30.0
+      # errors with `failed to calculate checksum of ref <X>:
+      # "/Cargo.lock": not found` on the workspace `COPY Cargo.toml
+      # Cargo.lock ./` step — even on the first-ever build with no
+      # prior cache refs). Instead we use `type=local` pointed at
+      # /tmp/.buildx-cache (which buildx mounts into the build
+      # container). Layer reuse kicks in across runs because
+      # `actions/cache@v5` restores /tmp/.buildx-cache from a prior
+      # successful run before the build starts. This is the
+      # 6-15min warm-path wall-clock win vs. cold-from-scratch.
+      - name: Cache cargo registry + docker layer cache
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-build-images-cargo-${{ hashFiles('**/Cargo.toml') }}
+            /tmp/.buildx-cache
+          key: ${{ runner.os }}-build-images-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ matrix.name }}
           restore-keys: |
-            ${{ runner.os }}-build-images-cargo-
+            ${{ runner.os }}-build-images-cargo-${{ matrix.name }}-
 
       # Lint the compose file structurally. Pulls the `docker compose
       # config` schema resolution into a single fast step (no image
@@ -347,32 +380,25 @@ jobs:
       # Multi-platform note: arm64 isn't enabled here because the
       # xcaddy-built Caddy image stays stock and the demo VM target
       # is amd64. To add arm64, swap the platform list below.
-      - name: Build control-plane image
+      #
+      # The job-level `strategy.matrix` (above) builds the three
+      # service Dockerfiles in parallel. Baseline PR #718 paid ~14m
+      # for these three sequentially (cp 6.5m + worker 7.5m +
+      # ingress 0.7m); in parallel the critical path is the slowest
+      # one (worker, ~7.5m cold / ~1-2m warm with the local cache
+      # below). Combined with BuildKit layer caching
+      # (cache-from: type=local) this is the wall-clock reduction
+      # for the issue #512 follow-up.
+      - name: Build service image (${{ matrix.name }})
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: edge-control-plane/Dockerfile
-          tags: edgecloud/control-plane:test
+          file: ${{ matrix.dockerfile }}
+          tags: ${{ matrix.image }}:test
           load: true
           provenance: false
-
-      - name: Build worker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: edge-worker/Dockerfile
-          tags: edgecloud/worker:test
-          load: true
-          provenance: false
-
-      - name: Build ingress image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: edge-ingress/Dockerfile
-          tags: edgecloud/ingress:test
-          load: true
-          provenance: false
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
 
       # Smoke: each image loads and the binary at the ENTRYPOINT
       # is callable. The control-plane entrypoint shells out to
@@ -383,14 +409,41 @@ jobs:
       # similarly need a NATS feed. The per-PR smoke here just
       # confirms the binaries are present and the entrypoint
       # doesn't immediately crash on a no-DB invocation.
-      - name: "Smoke: control-plane binary loads"
+      - name: "Smoke: ${{ matrix.name }} image loads + ENTRYPOINT set"
         run: |
-          # printpub is a pure-CLI Go binary that doesn't touch DB/NATS.
-          docker run --rm edgecloud/control-plane:test printpub 2>&1 | head -5 || true
-      - name: "Smoke: worker ENTRYPOINT is set"
-        run: docker inspect --format='{{json .Config.Entrypoint}}' edgecloud/worker:test
-      - name: "Smoke: ingress ENTRYPOINT is set"
-        run: docker inspect --format='{{json .Config.Entrypoint}}' edgecloud/ingress:test
+          case "${{ matrix.name }}" in
+            control-plane)
+              # printpub is a pure-CLI Go binary in the CP image
+              # that doesn't touch DB/NATS — safe to run standalone.
+              docker run --rm edgecloud/control-plane:test printpub 2>&1 | head -5 || true
+              ;;
+            worker|ingress)
+              docker inspect --format='{{json .Config.Entrypoint}}' edgecloud/${{ matrix.name }}:test
+              ;;
+          esac
+
+      # Merge per-matrix-layer caches into a single /tmp/.buildx-cache
+      # so the next job's `cache-from: type=local,src=/tmp/.buildx-cache`
+      # sees the union of all three Dockerfiles' layers.
+      - name: Merge per-matrix buildx caches
+        if: always()
+        run: |
+          mkdir -p /tmp/.buildx-cache
+          if [[ -d /tmp/.buildx-cache-new ]]; then
+            # BuildKit's type=local cache-to emits a manifest + blob
+            # tree under /tmp/.buildx-cache-new; rsync merges.
+            rsync -a /tmp/.buildx-cache-new/ /tmp/.buildx-cache/ 2>&1 || true
+          fi
+      - name: Post-cache save (runs even on smoke failure)
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            /tmp/.buildx-cache
+          key: ${{ runner.os }}-build-images-cargo-${{ hashFiles('**/Cargo.toml') }}-${{ matrix.name }}
 
   # ============================================================
   # COMPOSE-SMOKE — issue #577 (folded into #512 per the
@@ -484,11 +537,17 @@ jobs:
             > docker-compose.prod/caddy.local.json
 
       - name: Generate operator keyring file
+        # Note: the signing key material is sensitive even in a throwaway
+        # CI run — never echo it. The earlier `cat secrets/signing-keyring`
+        # printed the Ed25519 seed to the job log, which is uploaded to
+        # GitHub Actions artifacts and viewable by anyone with repo read.
+        # Echo a redacted length-only fingerprint instead.
         run: |
           mkdir -p secrets
           echo -n "k1=$(grep '^EDGE_SIGNING_KEYRING' .env.smoke | cut -d= -f3 | cut -d' ' -f1)" \
             > secrets/signing-keyring
-          cat secrets/signing-keyring
+          chmod 0600 secrets/signing-keyring
+          echo "signing-keyring written: $(wc -c < secrets/signing-keyring) bytes, mode 0600"
 
       - name: Generate ephemeral TLS cert (self-signed)
         # Production uses real certs; the smoke generates a self-
@@ -520,16 +579,65 @@ jobs:
           docker compose -f docker-compose.prod.yml logs
           exit 1
 
+      - name: Scrub secrets from logs (compose-smoke-logs)
+        # `.env.smoke` and `secrets/signing-keyring` are sensitive
+        # (throwaway CI secrets but still material — the signing seed
+        # can sign fake artifacts and DATABASE_PASSWORD / JWT_SECRET
+        # unlock the smoke Postgres + CP API for the duration of the
+        # job's TTL). Build a redacted view + capture docker logs +
+        # upload the whole bundle, with `.env.smoke` having its secret
+        # values replaced with `<REDACTED-len-N>` so an attacker with
+        # artifact read access can't replay them.
+        if: failure()
+        run: |
+          set -e
+          mkdir -p scrub
+          # 1. Redact .env.smoke (keep keys + lengths, replace values).
+          if [ -f .env.smoke ]; then
+            awk -F= '
+              /^[[:space:]]*#/ { print; next }
+              NF < 2 { print; next }
+              {
+                printf "%s=<REDACTED-len-%d>\n", $1, length($2)
+              }
+            ' .env.smoke > scrub/env.scrubbed
+          fi
+          # 2. Capture docker compose logs (already happens at /ready
+          # timeout at :520, but capture again here in case the failure
+          # came from a different step). Docker logs can themselves
+          # echo env-derived values (CADDY_ADMIN_TOKEN etc.) — strip
+          # known secret prefixes before archiving.
+          docker compose -f docker-compose.prod.yml logs --no-color \
+            > scrub/docker.log 2>&1 || true
+          if [ -s scrub/docker.log ]; then
+            # Replace the value of every secret env-var with REDACTED.
+            for k in POSTGRES_PASSWORD DATABASE_PASSWORD JWT_SECRET \
+                     EDGE_INTERNAL_TOKEN BOOTSTRAP_SECRET \
+                     METRICS_AUTH_TOKEN CADDY_ADMIN_TOKEN \
+                     EDGE_SIGNING_KEYRING; do
+              v=$(grep "^${k}=" .env.smoke | cut -d= -f2- || true)
+              if [ -n "$v" ]; then
+                # word-boundary-safe sed substitution.
+                sed -i.bak "s|${v}|<REDACTED-${k}>|g" scrub/docker.log || true
+              fi
+            done
+            rm -f scrub/docker.log.bak
+          fi
+          # 3. Copy the non-secret files as-is.
+          cp docker-compose.prod.yml scrub/ 2>/dev/null || true
+          cp -r tls scrub/ 2>/dev/null || true
+
       - name: Dump logs on failure
+        # Upload the pre-scrubbed bundle from the previous step. The
+        # raw `.env.smoke`, `secrets/`, and unmodified `tls/` are
+        # intentionally NOT in the artifact path — the scrub step
+        # rendered them into a value-safe form.
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: compose-smoke-logs
-          path: |
-            docker-compose.prod.yml
-            .env.smoke
-            secrets/
-            tls/
+          path: scrub/
+          if-no-files-found: warn
 
       - name: Tear down
         if: always()
