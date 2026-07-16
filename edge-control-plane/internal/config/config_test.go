@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -187,6 +188,64 @@ func TestLoad_EnvVarOverridesYAML(t *testing.T) {
 	}
 	if cfg.JWT.Secret != envSecret {
 		t.Errorf("JWT.Secret = %q, want env value %q", cfg.JWT.Secret, envSecret)
+	}
+}
+
+// TestLoad_NATSReplicasEnvVarOverridesYAML is the regression for the
+// issue-#512 follow-up: docker-compose.prod.yml:118 sets
+// `NATS_REPLICAS: "1"` for the single-node demo stack, but the
+// CP's NATSConfig.Replicas was previously only populated from
+// config.yaml's `nats.replicas:` field. On a stock config.yaml (which
+// omits the field) Go zero-valued it to 0 and the compose env var
+// was dead config — the CP just happened to land on JetStream
+// default 1 anyway because single-node NATS forces it. This test
+// pins the new env-var reader so operators can override the replica
+// count on a multi-node NATS cluster without editing config.yaml.
+func TestLoad_NATSReplicasEnvVarOverridesYAML(t *testing.T) {
+	yamlReplicas := 5
+	body := "jwt:\n  secret: \"" + validSecret + "\"\n" +
+		"nats:\n  replicas: " + strconv.Itoa(yamlReplicas) + "\n"
+	path := writeConfig(t, body)
+
+	// env wins over YAML.
+	t.Setenv("NATS_REPLICAS", "3")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.NATS.Replicas != 3 {
+		t.Errorf("NATS.Replicas = %d, want env value 3", cfg.NATS.Replicas)
+	}
+
+	// Removing the env falls back to YAML.
+	t.Setenv("NATS_REPLICAS", "")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load (yaml fallback): %v", err)
+	}
+	if cfg.NATS.Replicas != yamlReplicas {
+		t.Errorf("NATS.Replicas = %d, want yaml fallback %d", cfg.NATS.Replicas, yamlReplicas)
+	}
+
+	// Garbage env fails closed.
+	t.Setenv("NATS_REPLICAS", "not-a-number")
+	if _, err := Load(path); err == nil {
+		t.Errorf("expected error for non-integer NATS_REPLICAS, got nil")
+	} else if !strings.Contains(err.Error(), "NATS_REPLICAS") {
+		t.Errorf("error %q should mention NATS_REPLICAS", err.Error())
+	}
+
+	// 0 / negative fails closed — JetStream rejects replicas<1 anyway,
+	// and the operator almost certainly meant something else.
+	for _, bad := range []string{"0", "-1"} {
+		t.Run("rejected="+bad, func(t *testing.T) {
+			t.Setenv("NATS_REPLICAS", bad)
+			if _, err := Load(path); err == nil {
+				t.Errorf("expected error for NATS_REPLICAS=%q, got nil", bad)
+			} else if !strings.Contains(err.Error(), "NATS_REPLICAS") {
+				t.Errorf("error %q should mention NATS_REPLICAS", err.Error())
+			}
+		})
 	}
 }
 
