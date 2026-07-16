@@ -1,0 +1,21 @@
+{
+  "admin": {
+    "listen": "0.0.0.0:2019",
+    "identity": {
+      "identifiers": ["${CADDY_ADMIN_TOKEN}"],
+      "keys": {
+        "${CADDY_ADMIN_TOKEN}": "${CADDY_ADMIN_TOKEN}"
+      }
+    }
+  },
+  "apps": {
+    "http": {
+      "servers": {}
+    },
+    "tls": {
+      "automation": {
+        "on_demand": false
+      }
+    }
+  }
+}

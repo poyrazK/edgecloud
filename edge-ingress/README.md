@@ -221,6 +221,19 @@ the next heartbeat burst — trigger one with a NATS `pub` if needed).
   `EDGE_WORKER_ADDR` manually. Cloud metadata endpoints
   (`http://169.254.169.254/`) are a v2 enhancement.
 
+## Production-equivalent deployment (issue #512)
+
+For a single-host demo deployment, `docker-compose.prod.yml` (sibling to
+`docker-compose.yml`) brings up the control plane, the worker, this
+ingress, and a stock `caddy:2` image as a service. The compose file
+overrides `CADDY_ADMIN_LISTEN=0.0.0.0:2019` and `CADDY_ADMIN_URL=http://caddy:2019`
+on the ingress service so the admin API is reachable from inside the
+ingress container — without that override, `localhost:2019` inside
+Caddy's netns is unreachable from the ingress (issue #279).
+
+See [`docs/prod-compose.md`](../docs/prod-compose.md) for the
+operator workflow (`make prod-up` / `prod-smoke` / `prod-reset`).
+
 ## Out of scope (separate issues)
 
 | Issue | Topic                                                                 |

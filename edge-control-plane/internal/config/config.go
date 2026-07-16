@@ -345,6 +345,23 @@ func Load(path string) (*Config, error) {
 	if v := os.Getenv("NATS_URL"); v != "" {
 		cfg.NATS.URL = v
 	}
+	// NATS_REPLICAS: number of JetStream replicas for the streams the
+	// CP declares at boot (edgecloud.tasks + edgecloud.rate_limits).
+	// docker-compose.prod.yml:118 sets this to "1" for the single-node
+	// demo — without this env-var reader, the CP defaulted to whatever
+	// config.yaml said (typically unset → Go zero-value 0 → JetStream
+	// implicit-default 1, which happens to work but doesn't honor
+	// operator intent on a multi-node NATS cluster).
+	if v := os.Getenv("NATS_REPLICAS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("NATS_REPLICAS must be a valid integer: %w", err)
+		}
+		if n < 1 {
+			return nil, fmt.Errorf("NATS_REPLICAS must be >= 1 (got %d)", n)
+		}
+		cfg.NATS.Replicas = n
+	}
 	if v := os.Getenv("APP_HOST"); v != "" {
 		cfg.App.Host = v
 	}

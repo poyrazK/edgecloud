@@ -7,10 +7,23 @@
 #   make run-api       # foreground control plane
 #
 # See README.md → "Local development" for the full workflow.
+#
+# Production-equivalent stack (Dockerfiles + compose file; issue #512):
+#
+#   make prod-secrets    # render operator-specific secret files from .env.prod
+#   make prod-up         # build + start the full stack (Postgres, NATS, CP, worker, ingress, Caddy)
+#   make prod-bootstrap  # one-command bootstrap: bring up + signup + deploy + smoke (issue #512 closeout)
+#   make prod-smoke      # alias for prod-bootstrap
+#   make prod-down       # stop, keep volumes
+#   make prod-reset      # nuke volumes + re-apply migrations
+#
+# See docs/prod-compose.md for the full operator workflow.
 
 .PHONY: infra-up infra-down infra-logs infra-ps infra-reset \
         migrate run-api run-worker help \
-        dev dev-prereqs dev-install dev-config dev-down dev-clean
+        dev dev-prereqs dev-install dev-config dev-down dev-clean \
+        prod-secrets prod-up prod-down prod-logs prod-ps prod-reset \
+        prod-bootstrap prod-smoke prod-migrate
 
 # Load .env at parse time so DATABASE_PASSWORD/POSTGRES_* survive into
 # every recipe shell AND into recursive $(MAKE) invocations (e.g. the
@@ -26,6 +39,23 @@
 -include .env
 export DATABASE_USER DATABASE_PASSWORD DATABASE_NAME DATABASE_HOST DATABASE_PORT DATABASE_SSLMODE
 export POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB
+
+# Production env (issue #512). `-include` (not `include`) so a missing
+# .env.prod is non-fatal — prod-up / prod-reset print the "copy
+# .env.prod.example" error before any compose work runs. The dev
+# targets that don't touch prod don't read these.
+-include .env.prod
+export \
+    APP_REGION REGION WORKER_ID WORKER_TENANT_ID EDGE_WORKER_ADDR \
+    JWT_SECRET JWT_TTL_HOURS JWT_ISSUER \
+    EDGE_INTERNAL_TOKEN BOOTSTRAP_SECRET \
+    NATS_URL NATS_REPLICAS \
+    EDGE_REQUIRE_SIGNATURE EDGE_SIGNING_KEY_ID EDGE_SIGNING_KEYRING \
+    METRICS_AUTH_TOKEN \
+    EDGE_MIGRATE_PATH EDGE_WASM2CWASM_PATH \
+    CADDY_ADMIN_TOKEN \
+    TLS_CERT_FILE TLS_KEY_FILE \
+    QUOTA_FETCH_INTERVAL RATE_LIMIT_FETCH_INTERVAL DOMAIN_POLL_INTERVAL
 
 help:                   ## Show this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "Targets:\n"} \
@@ -148,3 +178,108 @@ dev-down:              ## Stop postgres + nats containers (preserves the Postgre
 
 dev-clean:             ## Stop everything + wipe ~/.edgecloud state. Run with `bash scripts/dev-clean.sh --purge` to also wipe artifacts.
 	@bash scripts/dev-clean.sh
+
+# ----- Production-equivalent stack (issue #512) -----
+#
+# Dockerfiles are committed at edge-{control-plane,worker,ingress}/
+# Dockerfile. The compose file lives at docker-compose.prod.yml (repo
+# root) and brings up Postgres + NATS + the three services + Caddy on
+# a single Linux host. Mirrors the dev infra-* shape but with
+# multi-stage builds, secrets via .env.prod, and healthcheck-gated
+# dependency ordering.
+#
+# Pre-flight: `cp .env.prod.example .env.prod` and edit the
+# placeholders. The compose strict-fails on any unset secret via
+# `${VAR:?msg}` (same pattern as the dev compose on line 28, per PR
+# #264 / #670).
+
+# Render operator-specific files from .env.prod. Currently emits:
+#   - docker-compose.prod/caddy.local.json — Caddy's `/etc/caddy/caddy.json`
+#     with the operator's CADDY_ADMIN_TOKEN substituted in. Caddy
+#     refuses to start with a placeholder bearer token, so this must
+#     run before `prod-up`.
+# Future: ./secrets/signing-keyring if EDGE_SIGNING_KEYRING_PATH
+# points at a host path the operator can't pre-create (current
+# expectation is operators bring their own).
+prod-secrets:          ## Render operator-specific files from .env.prod.
+	@if [ ! -f .env.prod ]; then \
+		echo "error: .env.prod not found. Copy .env.prod.example:  cp .env.prod.example .env.prod" >&2; \
+		exit 1; \
+	fi
+	@if [ -z "$$CADDY_ADMIN_TOKEN" ] || echo "$$CADDY_ADMIN_TOKEN" | grep -Eq '^replace-me'; then \
+		echo "error: CADDY_ADMIN_TOKEN must be set in .env.prod (not the placeholder)." >&2; \
+		exit 1; \
+	fi
+	@mkdir -p secrets
+	@envsubst < docker-compose.prod/caddy.json > docker-compose.prod/caddy.local.json
+	@echo "Rendered docker-compose.prod/caddy.local.json (and a secrets/ scaffold)."
+
+prod-up:               ## Build + start the production-equivalent stack.
+	@if [ ! -f .env.prod ]; then \
+		echo "error: .env.prod not found. Copy .env.prod.example:  cp .env.prod.example .env.prod" >&2; \
+		exit 1; \
+	fi
+	@if [ ! -f docker-compose.prod/caddy.local.json ]; then \
+		echo "notice: docker-compose.prod/caddy.local.json not found. Running 'make prod-secrets' first."; \
+		$(MAKE) prod-secrets; \
+	fi
+	set -a; . ./.env.prod; set +a; \
+	  docker compose -f docker-compose.prod.yml up -d --build
+	@echo ""
+	@echo "API:        http://localhost:8080/health"
+	@echo "Caddy:      http://localhost:2019/config/  (admin API)"
+	@echo "Deploy via the edge CLI from your host or run make prod-smoke to seed + curl through Caddy."
+
+prod-down:             ## Stop the production-equivalent stack (keeps volumes).
+	docker compose -f docker-compose.prod.yml down
+
+prod-logs:             ## Tail logs from all production services.
+	docker compose -f docker-compose.prod.yml logs -f
+
+prod-ps:               ## Show container status.
+	docker compose -f docker-compose.prod.yml ps
+
+prod-reset:            ## Stop, wipe volumes, re-apply migrations.
+	@if [ ! -f .env.prod ]; then \
+		echo "error: .env.prod not found. Copy .env.prod.example:  cp .env.prod.example .env.prod" >&2; \
+		exit 1; \
+	fi
+	set -a; . ./.env.prod; set +a; \
+	  docker compose -f docker-compose.prod.yml down -v && \
+	  docker compose -f docker-compose.prod.yml up -d --build
+	@echo "Volumes wiped; migrations re-applied on the cp container's first boot."
+
+# Apply migrations against the running prod Postgres. Useful when
+# the CP entrypoint's auto-migrate step is bypassed (SKIP_MIGRATE_ON_BOOT=true)
+# and migrations need to be run via a one-shot container. Mirrors
+# the dev `migrate` target shape.
+prod-migrate:          ## Apply pending migrations against the running prod Postgres.
+	@if [ ! -f .env.prod ]; then \
+		echo "error: .env.prod not found. Copy .env.prod.example:  cp .env.prod.example .env.prod" >&2; \
+		exit 1; \
+	fi
+	set -a; . ./.env.prod; set +a; \
+	  docker compose -f docker-compose.prod.yml run --rm cp migrate -up
+
+# One-command operator bootstrap. Generates the Ed25519 signing keyring,
+# self-signed TLS cert, fills any unset placeholders in .env.prod, brings
+# up the stack, waits on deep /ready, signs up a tenant + api_key,
+# builds edge-cli on the host, deploys + activates samples/hello, polls
+# Caddy until the route exists, smoke-asserts HTTP 200 through
+# Caddy → ingress → worker, and persists state/seed.json so re-runs
+# are idempotent.
+#
+# Single source of truth for the prod smoke flow. Used by the CI
+# `compose-smoke` job (via `make prod-smoke`).
+#
+# Pre-flight: `cp .env.prod.example .env.prod` — the script fills any
+# `replace-me-*` placeholder with a freshly-generated secret. Secrets
+# you set yourself are left alone. Requires Docker + openssl + jq +
+# cargo with the wasm32-wasip2 target on the host.
+prod-bootstrap:        ## One-command prod stack bootstrap (issue #512 closeout).
+	@bash scripts/bootstrap-prod.sh
+
+# Smoke = prod-bootstrap. Kept as an alias so CI recipes and operators
+# used to `make prod-smoke` continue to work.
+prod-smoke:            ## Alias for prod-bootstrap.
+	@$(MAKE) prod-bootstrap
