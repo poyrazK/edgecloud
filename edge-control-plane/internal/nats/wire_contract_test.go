@@ -237,6 +237,14 @@ func TestWireContract_DomainAppStatusFieldOrder(t *testing.T) {
 		"dedupe_id",
 		"resident_seconds",
 		"duration_ms_total",
+		// Issue #84 ask 6/7: per-deployment 5xx counter (PR A).
+		// Bare uint64 with omitempty so legacy workers that omit
+		// the field round-trip to 0; new workers serialize the
+		// value. Position mirrors DurationMsTotal (issue #555) —
+		// placed before protocol so existing fixtures stay
+		// byte-compatible (protocol was the last field added by
+		// issue #548).
+		"status_5xx_count",
 		// Issue #548: protocol indicates whether the worker serves
 		// this app via HTTP (default) or raw-TCP. The Rust side uses
 		// `#[serde(default)]` + `skip_serializing_if`, so legacy

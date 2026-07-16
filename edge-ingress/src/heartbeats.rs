@@ -1090,6 +1090,11 @@ mod tests {
             // L4RoutingTable lands.
             protocol: "http".to_string(),
             duration_ms_total: 0,
+            // Issue #84 ask 6/7: per-deployment 5xx counter mirrored
+            // from the worker's heartbeat AppStatus. Ingress doesn't
+            // act on it — it just needs to deserialize the wire shape
+            // without a missing-field error.
+            status_5xx_count: 0,
         }
     }
 
