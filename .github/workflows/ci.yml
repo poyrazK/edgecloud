@@ -433,10 +433,17 @@ jobs:
             control-plane)
               # 1. Entry script must be in the image. ENOENT here
               #    surfaces the silent COPY drop that compose-smoke
-              #    would otherwise catch 10 minutes later.
-              docker run --rm --entrypoint=/bin/sh edgecloud/control-plane:test \
-                -c 'ls -la /usr/local/bin/docker-entrypoint.sh && \
-                    head -5 /usr/local/bin/docker-entrypoint.sh'
+              #    would otherwise catch 10 minutes later. We can't
+              #    `docker run ... /bin/sh` to ls the file because
+              #    distroless/base-debian12 doesn't ship /bin/sh
+              #    (it's at /busybox/sh only after the runtime pulls
+              #    busybox into PATH, which we don't). Use `docker
+              #    create` + `docker cp` to read the file straight
+              #    out of the image's filesystem without exec'ing.
+              cid=$(docker create edgecloud/control-plane:test)
+              docker cp "$cid":/usr/local/bin/docker-entrypoint.sh - \
+                | head -5
+              docker rm "$cid" >/dev/null
               # 2. printpub is a pure-CLI Go binary that doesn't
               #    touch DB/NATS — safe to run standalone.
               docker run --rm edgecloud/control-plane:test printpub 2>&1 | head -5 || true
