@@ -4,10 +4,19 @@ This runbook documents the production-equivalent Docker compose stack for
 edgeCloud. The stack mirrors `scripts/dev-up.sh` but bundles everything as
 container images and is suitable for a single-VM demo deployment.
 
-> **TL;DR.** `make prod-up` (after `cp .env.prod.example .env.prod` and
-> filling in secrets). `make prod-smoke` waits on `/ready` and prints
-> the next operator step. `make prod-down` stops, `make prod-reset`
-> wipes volumes.
+> **TL;DR.** Two paths:
+>
+> **One-command bootstrap** (recommended for demos / fresh installs):
+> `cp .env.prod.example .env.prod && make prod-bootstrap` — generates
+> keyring + TLS + signs up a tenant + deploys `samples/hello` and
+> asserts HTTP 200 through Caddy end-to-end.
+>
+> **Manual** (when you want to control every secret yourself):
+> `cp .env.prod.example .env.prod`, fill the `replace-me-*`
+> placeholders, then `make prod-secrets && make prod-up && make
+> prod-smoke`.
+>
+> `make prod-down` stops, `make prod-reset` wipes volumes.
 
 ## What runs where
 
@@ -26,6 +35,107 @@ Image versions are commit-pinned per build — `latest` here means "the
 image built from `HEAD` of the running checkout." Tag-bumping +
 `compose pull && up` is the production deploy path (tracked as a
 follow-up to #578).
+
+## One-command bootstrap
+
+For a demo VM or a fresh install on a Linux host, `make prod-bootstrap`
+collapses the five operator steps (keyring, TLS, .env edit, prod-up,
+manual smoke) into one invocation:
+
+```bash
+cp .env.prod.example .env.prod
+make prod-bootstrap
+```
+
+What `scripts/bootstrap-prod.sh` does, in order:
+
+1. **Preflight.** `docker`, `docker compose`, `openssl`, `jq`, `cargo`,
+   and the `wasm32-wasip2` rustup target must all be on `$PATH`. The
+   script exits with a precise `bootstrap: FATAL: <tool>` message
+   otherwise.
+2. **Ed25519 signing keyring.** Writes `./secrets/signing-keyring`
+   with `k1 = <32-byte-hex-seed>` (mode 0600) the first time. Re-runs
+   reuse the existing file so the worker's `EDGE_REQUIRE_SIGNATURE=true`
+   contract is preserved across resets.
+3. **Self-signed TLS cert.** Writes `./tls/cert.pem` + `./tls/key.pem`
+   with a SAN that covers `*.edgecloud.dev`, `edgecloud.dev`,
+   `localhost`, and `127.0.0.1`. Curl-based smoke runs work without DNS
+   rewrites as long as the consumer honours `Host:` headers.
+4. **`.env.prod` population.** The script copies `.env.prod.example`
+   if you haven't, then for each of `DATABASE_PASSWORD`,
+   `POSTGRES_PASSWORD`, `JWT_SECRET`, `EDGE_INTERNAL_TOKEN`,
+   `BOOTSTRAP_SECRET`, `METRICS_AUTH_TOKEN`, `CADDY_ADMIN_TOKEN`,
+   `EDGE_SIGNING_KEY_ID`, `EDGE_SIGNING_KEYRING`: if the value is
+   empty or still a `replace-me-*` token, it's overwritten with a
+   freshly-generated secret. Anything you've set yourself is left
+   alone (the check is grep-based, not strict-fail). It also resets
+   a stale `EDGE_WORKER_ADDR=*.example.com` to the compose-internal
+   `worker` since the ingress appends the per-app port from
+   heartbeats (issue #641).
+5. **`make prod-up`.** Builds the three service images and starts
+   all six services. The CP entrypoint runs `migrate -up` then execs
+   `api` (`scripts/docker-entrypoint.sh`).
+6. **`/ready` poll.** Up to `EDGECLOUD_PROD_READY_TIMEOUT` seconds
+   (default 120). Status `ok` or `degraded` per issue #48 — the deep
+   readiness snapshot covers DB ping + NATS flush + per-loop health.
+7. **Build edge-cli** on the host (`cargo build --release --bin
+   edge`).
+8. **Signup.** `edge auth signup --name ... --plan free --key-name
+   default --force`. Captures `tenant_id` + `api_key` from the CLI's
+   config persistence at `~/.config/edgecloud/config.toml`.
+9. **Build + deploy + activate `samples/hello`** in
+   `samples/hello/` (the canonical FaaS sample). Reuses the
+   persisted deployment if the existing activation is still current.
+10. **Caddy route poll.** Waits (default 120s) for
+    `/config/` to publish a `host` matcher for
+    `t_<id>-hello.edgecloud.dev`. This is the ingress's
+    heartbeat-driven route install.
+11. **HTTP smoke assert.** `curl -H "Host: t_<id>-hello.edgecloud.dev"
+    http://127.0.0.1:80/hello` and asserts HTTP 200. On failure,
+    dumps redacted compose logs to stderr for diagnosis — secret
+    values are scrubbed in the dump so they don't leak into CI
+    artefacts.
+12. **Persists `state/seed.json`** (mode 0600) with `{tenant_id,
+    tenant_name, api_key, app_name, deployment_id, host,
+    generated_at}` so subsequent runs skip the signup step.
+
+### Idempotency
+
+`make prod-bootstrap` is safe to re-run. It:
+
+- Reuses `secrets/signing-keyring`, `tls/cert.pem`, and `tls/key.pem`
+  if present.
+- Reuses `state/seed.json`'s `api_key` and re-validates it via
+  `edge auth whoami` — if the CP rejects it (DB reset in between),
+  falls through to a fresh signup.
+- Always redeploys `samples/hello` so the smoke check exercises the
+  full activate → heartbeat → ingress path, catching regressions
+  that a stale deployment would mask.
+
+### Skipping the manual steps
+
+If you only need the smoke (no signup, no sample deploy), run
+`make prod-up` then curl directly: the existing `make prod-smoke`
+just aliases `make prod-bootstrap`, so to skip the heavy steps
+without losing the convenience:
+
+```bash
+make prod-up
+until curl -fsS http://127.0.0.1:8080/ready | jq -e '.status == "ok" or .status == "degraded"'; do
+  sleep 2
+done
+```
+
+### Required host binaries
+
+- `docker` 24+ with the `compose` plugin.
+- `openssl` 1.1 or 3.x.
+- `jq` 1.6+.
+- `cargo` + rustup stable + `rustup target add wasm32-wasip2`.
+- A reachable daemon (`docker info` succeeds).
+
+These mirror the dev `scripts/dev-install.sh` shape; on macOS the
+existing `make dev-install` preflight handles most of them.
 
 ## Pre-flight: secrets
 
@@ -96,18 +206,27 @@ Bring-up time on a warm-cache host is ~30 seconds; cold cache pays
 ## Verifying the boot
 
 ```bash
-make prod-smoke
-# Polls http://localhost:8080/ready until status is "ok" or "degraded";
-# prints the next step — manually `docker compose exec cp bash` →
-# `cd /samples/hello && edge deploy . && edge activate`.
+make prod-smoke           # alias for prod-bootstrap (idempotent)
 ```
 
-A 200 through Caddy after `edge activate` confirms the full path:
+If you've already brought up the stack via `make prod-up` and just
+need a status check without re-running the deploy:
 
 ```bash
-# From your laptop, with a tunnel/SSH to the host's :80:
-curl -H "Host: t_smoke-hello.edgecloud.dev" http://localhost/hello
-# Expect: 200, body "Hello, edgeCloud!"
+# Status check only — /ready (deep readiness) and /health (liveness):
+curl -fsS http://localhost:8080/ready | jq .
+curl -fsS http://localhost:8080/health
+```
+
+A 200 through Caddy after bootstrap confirms the full path
+(Caddy → ingress → worker → wasmtime → guest):
+
+```bash
+# Reads tenant_id + host from state/seed.json written by prod-bootstrap:
+TENANT_ID=$(jq -r .tenant_id state/seed.json)
+HOST=$(jq -r .host state/seed.json)
+curl -H "Host: $HOST" http://localhost/hello | jq .
+# Expect: 200 + JSON body from samples/hello
 ```
 
 ## Daily operations
@@ -176,5 +295,7 @@ above for local dev iteration.
 | `edge-worker/Dockerfile`          | Multi-stage: Rust builder → Debian slim runtime. |
 | `edge-ingress/Dockerfile`         | Multi-stage: Rust builder → Debian slim runtime. |
 | `scripts/docker-entrypoint.sh`    | CP image entrypoint: migrate up → exec api. |
-| `Makefile`                        | `prod-*` targets (prod-up / prod-down / prod-reset / prod-smoke / prod-migrate / prod-secrets). |
+| `Makefile`                        | `prod-*` targets (`prod-up`, `prod-down`, `prod-reset`, `prod-bootstrap`, `prod-smoke`, `prod-migrate`, `prod-secrets`). |
+| `scripts/bootstrap-prod.sh`       | One-command bootstrap. Brings up the stack, signs up a tenant, deploys `samples/hello`, smoke-asserts HTTP 200, persists `state/seed.json`. Idempotent. |
+| `state/seed.json`                 | Output of `prod-bootstrap` (mode 0600). Re-read by re-runs to skip signup + reuse the persisted api_key. |
 | `.github/workflows/ci.yml`        | `build-images` job (PR+main), `compose-smoke` job (main only). |

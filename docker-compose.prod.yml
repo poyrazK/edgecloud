@@ -299,8 +299,23 @@ services:
       - caddy-config-prod:/config
     networks:
       - edgecloud
-    ports:
-      - "2019:2019"   # admin API
+    # The admin API must be reachable from the ingress container
+    # (which `POST /load`s on every heartbeat-driven routing change)
+    # but MUST NOT be exposed on the host. `expose:` (Compose-level)
+    # makes the port reachable only on the `edgecloud` docker
+    # network — no host-side bind. Operators that need to debug the
+    # admin API can `docker compose exec caddy wget -qO- \
+    # http://localhost:2019/config/` from inside the container, or
+    # temporarily add a `ports:` line via a compose override.
+    #
+    # Note: previously this used `ports: ["2019:2019"]` which
+    # host-exposed the admin API on every interface. Anyone on the
+    # LAN could `curl http://<host>:2019/config/` and dump the full
+    # Caddyfile — including the bearer CADDY_ADMIN_TOKEN (when one
+    # is configured) and every routing rule. The `expose:` form is
+    # fail-closed.
+    expose:
+      - "2019"
     environment:
       # The `caddy:2` image only honors CADDY_ADMIN_TOKEN when a
       # JSON config file sets the identity. Bind-mount puts a token

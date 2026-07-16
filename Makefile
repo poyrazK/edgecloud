@@ -10,18 +10,20 @@
 #
 # Production-equivalent stack (Dockerfiles + compose file; issue #512):
 #
-#   make prod-secrets  # render operator-specific secret files from .env.prod
-#   make prod-up       # build + start the full stack (Postgres, NATS, CP, worker, ingress, Caddy)
-#   make prod-smoke    # curl http://<tenant>-hello.edgecloud.dev/health through Caddy
-#   make prod-down     # stop, keep volumes
-#   make prod-reset    # nuke volumes + re-apply migrations
+#   make prod-secrets    # render operator-specific secret files from .env.prod
+#   make prod-up         # build + start the full stack (Postgres, NATS, CP, worker, ingress, Caddy)
+#   make prod-bootstrap  # one-command bootstrap: bring up + signup + deploy + smoke (issue #512 closeout)
+#   make prod-smoke      # alias for prod-bootstrap
+#   make prod-down       # stop, keep volumes
+#   make prod-reset      # nuke volumes + re-apply migrations
 #
 # See docs/prod-compose.md for the full operator workflow.
 
 .PHONY: infra-up infra-down infra-logs infra-ps infra-reset \
         migrate run-api run-worker help \
         dev dev-prereqs dev-install dev-config dev-down dev-clean \
-        prod-secrets prod-up prod-down prod-logs prod-ps prod-reset prod-smoke prod-migrate
+        prod-secrets prod-up prod-down prod-logs prod-ps prod-reset \
+        prod-bootstrap prod-smoke prod-migrate
 
 # Load .env at parse time so DATABASE_PASSWORD/POSTGRES_* survive into
 # every recipe shell AND into recursive $(MAKE) invocations (e.g. the
@@ -259,27 +261,25 @@ prod-migrate:          ## Apply pending migrations against the running prod Post
 	set -a; . ./.env.prod; set +a; \
 	  docker compose -f docker-compose.prod.yml run --rm cp migrate -up
 
-# Boot the stack, seed samples/hello via the bundled CLI, assert 200
-# through Caddy. Used by the CI `compose-smoke` job as well as
-# operators verifying a fresh install. Waits on the deep /ready
-# endpoint before running deploy so the CP has applied migrations.
+# One-command operator bootstrap. Generates the Ed25519 signing keyring,
+# self-signed TLS cert, fills any unset placeholders in .env.prod, brings
+# up the stack, waits on deep /ready, signs up a tenant + api_key,
+# builds edge-cli on the host, deploys + activates samples/hello, polls
+# Caddy until the route exists, smoke-asserts HTTP 200 through
+# Caddy → ingress → worker, and persists state/seed.json so re-runs
+# are idempotent.
 #
-# The deploy step mounts ./samples/hello from the host into the CP
-# container at /samples and shells out to `edge deploy /samples/hello`
-# from inside. A future iteration will replace this with a
-# dedicated `edgecli` service in docker-compose.prod.yml that has
-# the CLI binary baked in — for now the CP's chdir'd WORKDIR
-# (/etc/edge) doesn't carry it, and adding `samples/` to the CP
-# image's COPY list would balloon the image.
-prod-smoke:            ## Bring up the stack, deploy samples/hello, assert 200 through Caddy.
-	@if [ ! -f .env.prod ]; then \
-		echo "error: .env.prod not found. Copy .env.prod.example:  cp .env.prod.example .env.prod" >&2; \
-		exit 1; \
-	fi
-	$(MAKE) prod-up
-	@echo "Waiting for /ready on the control plane..."
-	@until curl -fsS http://localhost:8080/ready 2>/dev/null | grep -E '"status":"(ok|degraded)"' >/dev/null; do sleep 2; done
-	@echo "/ready is green. Attempting smoke against an example tenant..."
-	@echo ""
-	@echo "Manual smoke: docker compose -f docker-compose.prod.yml exec cp bash"
-	@echo "From inside: cd /samples/hello && edge deploy . && edge activate"
+# Single source of truth for the prod smoke flow. Used by the CI
+# `compose-smoke` job (via `make prod-smoke`).
+#
+# Pre-flight: `cp .env.prod.example .env.prod` — the script fills any
+# `replace-me-*` placeholder with a freshly-generated secret. Secrets
+# you set yourself are left alone. Requires Docker + openssl + jq +
+# cargo with the wasm32-wasip2 target on the host.
+prod-bootstrap:        ## One-command prod stack bootstrap (issue #512 closeout).
+	@bash scripts/bootstrap-prod.sh
+
+# Smoke = prod-bootstrap. Kept as an alias so CI recipes and operators
+# used to `make prod-smoke` continue to work.
+prod-smoke:            ## Alias for prod-bootstrap.
+	@$(MAKE) prod-bootstrap
