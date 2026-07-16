@@ -87,8 +87,8 @@ RUN mkdir -p \
     echo "" > edge-js-runtime-long/src/lib.rs && \
     echo "" > edge-test-helpers/src/lib.rs
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+RUN --mount=type=cache,id=ingress-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ingress-build-target,target=/build/target \
     cargo generate-lockfile && \
     cargo fetch --locked
 
@@ -121,8 +121,8 @@ COPY edge-js-runtime/                       edge-js-runtime/
 COPY edge-js-runtime-long/                  edge-js-runtime-long/
 COPY edge-test-helpers/                     edge-test-helpers/
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+RUN --mount=type=cache,id=ingress-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=ingress-build-target,target=/build/target \
     cargo build --release --bin edge-ingress && \
     mkdir -p /out && \
     cp /build/target/release/edge-ingress /out/edge-ingress

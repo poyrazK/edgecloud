@@ -418,12 +418,34 @@ jobs:
       # similarly need a NATS feed. The per-PR smoke here just
       # confirms the binaries are present and the entrypoint
       # doesn't immediately crash on a no-DB invocation.
+      #
+      # ALSO verify the entrypoint file lands in the image — without
+      # this, a silently-dropped COPY src (BuildKit treats missing
+      # src as "no source" and produces a layer with no file) only
+      # surfaces at compose-smoke container start as ENOENT, well
+      # after build-images has gone green (issue #512 regression on
+      # main, runs 29484641279 / 29486391663). `ls -la` on the
+      # entrypoint catches the silent drop at build time so PR
+      # authors see the failure inline.
       - name: "Smoke: ${{ matrix.name }} image loads + ENTRYPOINT set"
         run: |
           case "${{ matrix.name }}" in
             control-plane)
-              # printpub is a pure-CLI Go binary in the CP image
-              # that doesn't touch DB/NATS — safe to run standalone.
+              # 1. Entry script must be in the image. ENOENT here
+              #    surfaces the silent COPY drop that compose-smoke
+              #    would otherwise catch 10 minutes later. We can't
+              #    `docker run ... /bin/sh` to ls the file because
+              #    distroless/base-debian12 doesn't ship /bin/sh
+              #    (it's at /busybox/sh only after the runtime pulls
+              #    busybox into PATH, which we don't). Use `docker
+              #    create` + `docker cp` to read the file straight
+              #    out of the image's filesystem without exec'ing.
+              cid=$(docker create edgecloud/control-plane:test)
+              docker cp "$cid":/usr/local/bin/docker-entrypoint.sh - \
+                | head -5
+              docker rm "$cid" >/dev/null
+              # 2. printpub is a pure-CLI Go binary that doesn't
+              #    touch DB/NATS — safe to run standalone.
               docker run --rm edgecloud/control-plane:test printpub 2>&1 | head -5 || true
               ;;
             worker|ingress)
@@ -471,7 +493,7 @@ jobs:
     # seeds `samples/hello`, and asserts 200 through Caddy. Skipping
     # PRs keeps the per-PR build latency reasonable. Operators can
     # trigger ad-hoc with `gh workflow run`.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: build-images
     env:
       # Wall-clock budget for the seed + curl round trip. The job
@@ -585,7 +607,14 @@ jobs:
             sleep 2
           done
           echo "Timed out waiting for /ready"
-          docker compose -f docker-compose.prod.yml logs
+          # Source .env.smoke before invoking compose — the strict-fail
+          # `${POSTGRES_PASSWORD:?...}` re-interpolation on every compose
+          # invocation otherwise aborts with "POSTGRES_PASSWORD is
+          # missing a value" and we lose the actual CP failure signal
+          # (the previous `set -a; . ./.env.smoke; set +a` only covered
+          # the `up -d` line above, not subsequent compose commands).
+          set -a; . ./.env.smoke; set +a
+          docker compose -f docker-compose.prod.yml logs --no-color
           exit 1
 
       - name: Scrub secrets from logs (compose-smoke-logs)
@@ -615,7 +644,10 @@ jobs:
           # timeout at :520, but capture again here in case the failure
           # came from a different step). Docker logs can themselves
           # echo env-derived values (CADDY_ADMIN_TOKEN etc.) — strip
-          # known secret prefixes before archiving.
+          # known secret prefixes before archiving. Source .env.smoke
+          # first so compose's strict-fail env interpolation doesn't
+          # abort and leave us with an empty docker.log.
+          set -a; . ./.env.smoke; set +a
           docker compose -f docker-compose.prod.yml logs --no-color \
             > scrub/docker.log 2>&1 || true
           if [ -s scrub/docker.log ]; then
