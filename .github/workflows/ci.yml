@@ -585,7 +585,14 @@ jobs:
             sleep 2
           done
           echo "Timed out waiting for /ready"
-          docker compose -f docker-compose.prod.yml logs
+          # Source .env.smoke before invoking compose — the strict-fail
+          # `${POSTGRES_PASSWORD:?...}` re-interpolation on every compose
+          # invocation otherwise aborts with "POSTGRES_PASSWORD is
+          # missing a value" and we lose the actual CP failure signal
+          # (the previous `set -a; . ./.env.smoke; set +a` only covered
+          # the `up -d` line above, not subsequent compose commands).
+          set -a; . ./.env.smoke; set +a
+          docker compose -f docker-compose.prod.yml logs --no-color
           exit 1
 
       - name: Scrub secrets from logs (compose-smoke-logs)
@@ -615,7 +622,10 @@ jobs:
           # timeout at :520, but capture again here in case the failure
           # came from a different step). Docker logs can themselves
           # echo env-derived values (CADDY_ADMIN_TOKEN etc.) — strip
-          # known secret prefixes before archiving.
+          # known secret prefixes before archiving. Source .env.smoke
+          # first so compose's strict-fail env interpolation doesn't
+          # abort and leave us with an empty docker.log.
+          set -a; . ./.env.smoke; set +a
           docker compose -f docker-compose.prod.yml logs --no-color \
             > scrub/docker.log 2>&1 || true
           if [ -s scrub/docker.log ]; then
