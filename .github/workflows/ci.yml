@@ -471,7 +471,7 @@ jobs:
     # seeds `samples/hello`, and asserts 200 through Caddy. Skipping
     # PRs keeps the per-PR build latency reasonable. Operators can
     # trigger ad-hoc with `gh workflow run`.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: build-images
     env:
       # Wall-clock budget for the seed + curl round trip. The job
