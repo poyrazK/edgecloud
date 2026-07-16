@@ -234,7 +234,10 @@ COPY --from=rust-builder       --chown=65532:65532 /out/wasm2cwasm   /usr/local/
 # the container, so this works without per-binary flag plumbing.
 # The shell script must be in the distroless /bin/sh — base-debian12
 # ships dash, which can run this script unmodified.
-COPY --chown=65532:65532 scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# Path is repo-root-relative because `docker build` context is `.`
+# (the workspace root, not edge-control-plane/ — see the `build:`
+# block at docker-compose.prod.yml:98-100).
+COPY --chown=65532:65532 edge-control-plane/scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER 65532:65532
 ENV EDGE_WASM2CWASM_PATH=/usr/local/bin/wasm2cwasm \
