@@ -147,8 +147,8 @@ RUN mkdir -p \
     echo "" > edge-js-runtime-long/src/lib.rs && \
     echo "" > edge-test-helpers/src/lib.rs
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+RUN --mount=type=cache,id=cp-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cp-build-target,target=/build/target \
     cargo generate-lockfile && \
     cargo fetch --locked
 
@@ -164,8 +164,8 @@ COPY edge-runtime/bin/wasm2cwasm/             edge-runtime/bin/wasm2cwasm/
 COPY edge-config/                             edge-config/
 COPY edge-migrate/                            edge-migrate/
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+RUN --mount=type=cache,id=cp-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cp-build-target,target=/build/target \
     cargo build --release --bin edge-migrate && \
     cargo build --release --manifest-path edge-runtime/bin/wasm2cwasm/Cargo.toml --bin wasm2cwasm && \
     mkdir -p /out && \
