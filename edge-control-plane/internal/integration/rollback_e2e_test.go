@@ -231,7 +231,7 @@ func TestRollbackE2E(t *testing.T) {
 	t.Logf("phase 2 (activate %s) drained; last_good should now be %s", deploymentIDB, deploymentIDA)
 
 	// --- 8. Phase 3 — rollback (swaps active back to d_a) ---
-	rolledBackID, err := deploymentSvc.RollbackDeployment(ctx, testTenantID, testAppName, "")
+	rolledBackID, err := deploymentSvc.RollbackDeployment(ctx, testTenantID, testAppName, "", false)
 	require.NoError(t, err)
 	require.Equal(t, deploymentIDA, rolledBackID, "RollbackDeployment should return the rolled-back-to id")
 	drainUntilStable(t, drainer, ctx, 2*time.Second)

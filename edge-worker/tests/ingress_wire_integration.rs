@@ -230,6 +230,12 @@ async fn run_test() -> anyhow::Result<()> {
             ws_port: None,
             dedupe_id: None,
             last_error: None,
+            // Issue #84 asks 6/7: per-deployment 5xx counter. Not
+            // exercised by this wire-shape test (the CP-side
+            // cross-language test in cp_rollback_e2e.rs covers the
+            // value path); zero default keeps the wire identical
+            // for the legacy-compat assertions below.
+            status_5xx_count: 0,
             // Issue #548: protocol defaults to "http" for legacy
             // wire-shape integration tests; this test doesn't exercise
             // the L4 path (covered by edge-ingress/tests/l4_integration.rs

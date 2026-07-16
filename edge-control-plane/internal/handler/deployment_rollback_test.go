@@ -30,7 +30,7 @@ type stubRollbacker struct {
 	lastIdempotencyKey string
 }
 
-func (s *stubRollbacker) RollbackDeployment(_ context.Context, tenantID, appName, idempotencyKey string) (string, error) {
+func (s *stubRollbacker) RollbackDeployment(_ context.Context, tenantID, appName, idempotencyKey string, _ bool) (string, error) {
 	s.called = true
 	s.lastTenant = tenantID
 	s.lastApp = appName

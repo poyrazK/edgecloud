@@ -56,8 +56,12 @@ type DeploymentHandler struct {
 // deploymentRollbacker is the narrow contract the Rollback handler needs.
 // Kept package-local so handler tests can implement it inline without
 // having to mock the full DeploymentService surface.
+//
+// Issue #84 ask 7: trailing `isAutoTriggered` is always `false` for
+// the manual handler — the operator path emits the `rollback` webhook
+// event. `autoRollbacker` (handler/internal.go) passes `true`.
 type deploymentRollbacker interface {
-	RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string) (string, error)
+	RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string, isAutoTriggered bool) (string, error)
 }
 
 // deploymentActivator is the narrow contract the Activate handler needs.
@@ -979,7 +983,10 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName, idemKey)
+	// Issue #84 ask 7: trailing `isAutoTriggered = false` — the manual
+	// rollback handler; the service emits the `rollback` webhook
+	// event, distinct from the worker-driven `auto_rollback` event.
+	newID, err := h.rollbackSvc.RollbackDeployment(r.Context(), tenantID, appName, idemKey, false)
 	if err != nil {
 		if errors.Is(err, service.ErrTenantDisabled) {
 			httperror.ConflictCtx(w, r, "tenant is disabled")

@@ -536,8 +536,8 @@ type DeploymentService struct {
 	artifactStore           storage.ArtifactStore
 	publisher               nats.Publisher
 	appSvc                  *AppService
-	envSvc                  *EnvService     // injected for decryption at publish
-	webhookSvc              *WebhookService // injected for webhook events
+	envSvc                  *EnvService             // injected for decryption at publish
+	webhookSvc              WebhookServiceInterface // injected for webhook events (interface so tests can fake)
 	// cachePusher pushes the activation artifact bytes to a per-region
 	// edge-artifact-cache binary before the NATS TaskMessage publish
 	// (issue #332). Optional; when nil, the cache-push step is skipped
@@ -752,7 +752,7 @@ func (s *DeploymentService) SetPublishBuilder(b *publishBuilder) {
 	s.publishBuilder = b
 }
 
-func (s *DeploymentService) SetWebhookService(webhookSvc *WebhookService) {
+func (s *DeploymentService) SetWebhookService(webhookSvc WebhookServiceInterface) {
 	s.webhookSvc = webhookSvc
 }
 
@@ -1895,7 +1895,19 @@ func (s *DeploymentService) publishSwap(ctx context.Context, tenantID, appName, 
 // On success, returns the deployment_id that is now active (i.e., the
 // prior last_good value). The prior current deployment_id is overwritten
 // — there is no multi-step history in this minimum viable version.
-func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string) (string, error) {
+//
+// `isAutoTriggered` distinguishes the worker-driven auto-rollback path
+// (issue #74, POST /api/internal/apps/{appName}/auto-rollback) from the
+// operator-driven manual path. The two paths fire different webhook
+// events today: `"auto_rollback"` for the worker path (so operators
+// distinguish an auto-shift from a manual click on the dashboard), and
+// `"rollback"` for the operator path. The discriminator rides inside
+// the webhook payload (`"trigger": "worker_crash" | "operator"`) so
+// existing subscribers can match on the event class and inspect the
+// payload only when they care about which mechanism fired — see
+// `internal/domain/webhook.go::ValidWebhookEvents` for the closed
+// event-type set.
+func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, appName, idempotencyKey string, isAutoTriggered bool) (string, error) {
 	var rolledBackID string
 	var deploymentHash string
 	var deploymentSignature string
@@ -2176,9 +2188,37 @@ func (s *DeploymentService) RollbackDeployment(ctx context.Context, tenantID, ap
 	}
 
 	if s.webhookSvc != nil {
-		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, "rollback", map[string]string{
+		// Issue #84 ask 7: emit `auto_rollback` webhook when the
+		// worker drove the rollback (issue #74, POST
+		// /api/internal/apps/{appName}/auto-rollback). Manual /
+		// operator rollbacks continue to emit `rollback`. The
+		// payload carries a discriminator so subscribers can
+		// distinguish the two without subscribing to both events:
+		//   auto_rollback:   { trigger: "worker_crash", deployment_id, canary: "false"|"true" }
+		//   rollback:        { trigger: "operator",      deployment_id }
+		// `canary` is set to "true" on auto-rollback when the
+		// handler at internal.go:549 determined the app had an
+		// active `app_traffic_splits` row — operators can wire
+		// routing on it. Today the rollback service itself only
+		// sees the legacy single-slot path (PR B adds the canary
+		// branch), so the canary flag is currently hard-coded to
+		// "false"; the branch lives in the handler. Mirrors the
+		// canary shape across PR A/B so the closed webhook event
+		// set stays unchanged.
+		event := "rollback"
+		if isAutoTriggered {
+			event = "auto_rollback"
+		}
+		payload := map[string]string{
 			"deployment_id": rolledBackID,
-		})
+		}
+		if isAutoTriggered {
+			payload["trigger"] = "worker_crash"
+			payload["canary"] = "false"
+		} else {
+			payload["trigger"] = "operator"
+		}
+		s.webhookSvc.PublishEvent(context.Background(), tenantID, appName, event, payload)
 	}
 
 	return rolledBackID, nil

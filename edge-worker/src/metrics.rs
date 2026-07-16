@@ -21,6 +21,7 @@
 //!   - edge_outbound_bytes_total{deployment_id, app_name}        (IntCounter)
 //!   - edge_resident_seconds_total{deployment_id, app_name}      (IntCounter)
 //!   - edge_duration_ms_total{deployment_id, app_name}           (IntCounter)
+//!   - edge_status_5xx_total{deployment_id, app_name}            (IntCounter)
 //!   - edge_app_status{deployment_id, app_name, status}          (IntGaugeVec)
 //!     — set to 1 by set_status; clear previous via remove_label_values.
 //!     Swept on `unregister_app` so the active set is bounded by app
@@ -96,6 +97,13 @@ pub struct MetricsHandle {
     /// Bump with the wall-clock millis between request accept and
     /// response complete (FaaS only — see issue #555).
     pub duration_ms: IntCounter,
+    /// Bump with `meter.record_error()` from the `synthetic_500`
+    /// chokepoint that all three FaaS error terminal arms of
+    /// `handle_request` share (issue #84 asks 6/7). NOT bumped on
+    /// the body-cap 413 early return — that is a tenant-config
+    /// violation, not a guest error. Monotonic, the same as the
+    /// other four counters.
+    pub status_5xx: IntCounter,
     /// Registered boxes held for the unregister step.
     /// Field order mirrors the counter order; the boxes are
     /// `IntCounter` clones (the inner state is `Arc`, so the
@@ -104,6 +112,7 @@ pub struct MetricsHandle {
     pub outbound_bytes_box: Arc<dyn Collector>,
     pub resident_seconds_box: Arc<dyn Collector>,
     pub duration_ms_box: Arc<dyn Collector>,
+    pub status_5xx_box: Arc<dyn Collector>,
     /// `(tenant_id, deployment_id)` — used as the map key in
     /// `WorkerMetrics::apps`; also re-used to clear the
     /// `edge_app_status` gauge on `unregister_app`.
@@ -376,21 +385,34 @@ impl WorkerMetrics {
              #555). Handler apps only — LongRunning apps don't contribute \
              and the label set will not appear.",
         )?;
+        let status_5xx = register_one(
+            "edge_status_5xx_total",
+            "Per-app 5xx error count (issue #84 asks 6/7). Stamped \
+             from the `synthetic_500` chokepoint shared by the three \
+             FaaS error terminal arms of `handle_request`. \
+             Monotonic — NOT decremented by the heartbeat's \
+             snapshot-and-subtract path. Body-cap 413 early \
+             returns are NOT counted (tenant-config violation, \
+             not a guest error).",
+        )?;
 
         let requests_box: Arc<dyn Collector> = Arc::new(requests.clone());
         let outbound_bytes_box: Arc<dyn Collector> = Arc::new(outbound_bytes.clone());
         let resident_seconds_box: Arc<dyn Collector> = Arc::new(resident_seconds.clone());
         let duration_ms_box: Arc<dyn Collector> = Arc::new(duration_ms.clone());
+        let status_5xx_box: Arc<dyn Collector> = Arc::new(status_5xx.clone());
 
         let handle = Arc::new(MetricsHandle {
             requests,
             outbound_bytes,
             resident_seconds,
             duration_ms,
+            status_5xx,
             requests_box,
             outbound_bytes_box,
             resident_seconds_box,
             duration_ms_box,
+            status_5xx_box,
             tenant_id: tenant_id.to_string(),
             deployment_id: deployment_id.to_string(),
             app_name: app_name.to_string(),
@@ -473,6 +495,9 @@ impl WorkerMetrics {
         let _ = self
             .registry
             .unregister(Box::new(handle.duration_ms.clone()));
+        let _ = self
+            .registry
+            .unregister(Box::new(handle.status_5xx.clone()));
 
         // Drop every status series for this app. The IntGaugeVec
         // has a `remove_label_values` API keyed on the full label
@@ -714,6 +739,7 @@ mod tests {
         h.outbound_bytes.inc_by(1024);
         h.resident_seconds.inc_by(60);
         h.duration_ms.inc_by(120);
+        h.status_5xx.inc_by(7);
 
         let body = m.gather().unwrap();
         // The TextEncoder sorts labels alphabetically, so the
@@ -728,6 +754,10 @@ mod tests {
             .contains("edge_resident_seconds_total{app_name=\"api\",deployment_id=\"dep_a\"} 60"));
         assert!(
             body.contains("edge_duration_ms_total{app_name=\"api\",deployment_id=\"dep_a\"} 120")
+        );
+        assert!(
+            body.contains("edge_status_5xx_total{app_name=\"api\",deployment_id=\"dep_a\"} 7"),
+            "expected edge_status_5xx_total per-app series (issue #84); got:\n{body}"
         );
     }
 
@@ -759,6 +789,7 @@ mod tests {
             "edge_outbound_bytes_total",
             "edge_resident_seconds_total",
             "edge_duration_ms_total",
+            "edge_status_5xx_total",
         ] {
             assert!(
                 !body.contains(&format!(

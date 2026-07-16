@@ -471,6 +471,26 @@ pub struct AppStatus {
     /// `checkComputeMs`.
     #[serde(default)]
     pub duration_ms_total: u64,
+    /// Total 5xx-class request count since the last heartbeat
+    /// interval (issue #84 asks 6/7, fifth metered dimension). The
+    /// FaaS dispatch path stamps `meter.record_error()` from the
+    /// `synthetic_500` chokepoint that all three error terminal
+    /// arms of `handle_request` share (`Ok(Err)`,
+    /// `Err(_dropped)` with `exit_code != 0`,
+    /// `Err(_dropped)` with `exit_code == 0`). The body-cap 413
+    /// early return does NOT bump — it is a tenant-config
+    /// violation, not a guest error. LongRunning apps stamp 0
+    /// (the dispatch path never fires for LR). Defaults to 0 when
+    /// absent (legacy workers / pre-#84 deployments); the canary
+    /// auto-ramp service (`CanaryRampService`) treats the
+    /// absent-field case as "no errors this interval" — same
+    /// rolling-upgrade semantics as `outbound_bytes` (issue #210).
+    /// Wire shape mirrors `duration_ms_total`: no
+    /// `skip_serializing_if` so new workers always send the count
+    /// to a new control plane; legacy workers that omit the field
+    /// deserialize to 0.
+    #[serde(default)]
+    pub status_5xx_count: u64,
 }
 
 /// Kind of metric emitted via `edge:observe`.
@@ -737,6 +757,7 @@ mod tests {
             protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
+            status_5xx_count: 0,
             observer_metrics: vec![
                 MetricSample {
                     name: "hits".into(),
@@ -805,6 +826,7 @@ mod tests {
             protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
+            status_5xx_count: 0,
             observer_metrics: vec![],
             last_error: None,
         };
@@ -841,6 +863,7 @@ mod tests {
             protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
+            status_5xx_count: 0,
         };
         let json_none = serde_json::to_string(&none_status).expect("serialize");
         assert!(
@@ -905,6 +928,7 @@ mod tests {
             protocol: "http".to_string(),
             resident_seconds: None,
             duration_ms_total: 0,
+            status_5xx_count: 0,
         };
         let json_http = serde_json::to_string(&none_status).expect("serialize");
         assert!(
@@ -983,6 +1007,7 @@ mod tests {
                 protocol: "tcp".to_string(),
                 resident_seconds: None,
                 duration_ms_total: 0,
+                status_5xx_count: 0,
             },
         );
         let hb = HeartbeatMessage {
@@ -1050,6 +1075,7 @@ mod tests {
             last_error: None,
             resident_seconds: None,
             duration_ms_total: 0,
+            status_5xx_count: 0,
             observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");
@@ -1081,6 +1107,7 @@ mod tests {
             last_error: None,
             resident_seconds: Some(0),
             duration_ms_total: 0,
+            status_5xx_count: 0,
             observer_metrics: vec![],
         };
         let json = serde_json::to_string(&s).expect("serialize");
@@ -1136,6 +1163,7 @@ mod tests {
             dedupe_id: None,
             resident_seconds: None,
             duration_ms_total: 150,
+            status_5xx_count: 11,
             observer_metrics: vec![],
             protocol: "http".to_string(),
             last_error: None,
@@ -1144,6 +1172,76 @@ mod tests {
         assert!(
             json.contains(r#""duration_ms_total":150"#),
             "duration_ms_total must always appear in serialized AppStatus; got: {json}"
+        );
+        assert!(
+            json.contains(r#""status_5xx_count":11"#),
+            "status_5xx_count must always appear in serialized AppStatus; got: {json}"
+        );
+    }
+    // ── status_5xx_count rolling-upgrade contract (issue #84) ─────────
+
+    /// Old workers that don't send `status_5xx_count` must deserialize
+    /// to 0 (not fail). The canary auto-ramp service
+    /// (`CanaryRampService`) treats absent as "no errors this
+    /// interval" — same way the four existing metered dimensions
+    /// fold missing fields to 0 (`outbound_bytes`,
+    /// `duration_ms_total`). Mirrors
+    /// `outbound_bytes_absent_deserializes_to_zero` (issue #210)
+    /// and `duration_ms_total_absent_deserializes_to_zero`
+    /// (issue #555).
+    #[test]
+    fn status_5xx_count_absent_deserializes_to_zero() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":5,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(
+            s.status_5xx_count, 0,
+            "absent status_5xx_count must deserialize to 0 (rolling-upgrade contract)"
+        );
+    }
+
+    /// Explicit value round-trips correctly. Mirrors
+    /// `outbound_bytes_present_round_trips` and
+    /// `duration_ms_total_present_round_trips`.
+    #[test]
+    fn status_5xx_count_present_round_trips() {
+        let s = app_status_from_json(
+            r#"{"deployment_id":"d_1","status":"running","exit_code":null,"request_count":3,"outbound_bytes":1048576,"status_5xx_count":250,"tenant_id":"t_1","port":8080}"#,
+        );
+        assert_eq!(
+            s.status_5xx_count, 250,
+            "explicit status_5xx_count must round-trip"
+        );
+    }
+
+    /// Serialization always includes the field (no
+    /// `skip_serializing_if`), so new workers talking to new control
+    /// planes always send the 5xx count. LongRunning apps stamp 0
+    /// (the dispatch path never fires for LR); control planes
+    /// treat 0 as "no 5xx contribution this interval".
+    #[test]
+    fn status_5xx_count_always_serialized() {
+        let s = AppStatus {
+            deployment_id: "d_1".into(),
+            status: "running".into(),
+            exit_code: None,
+            request_count: 2,
+            outbound_bytes: 512,
+            tenant_id: "t_1".into(),
+            port: 8080,
+            ws_port: None,
+            dedupe_id: None,
+            resident_seconds: None,
+            duration_ms_total: 0,
+            status_5xx_count: 7,
+            observer_metrics: vec![],
+            protocol: "http".to_string(),
+            last_error: None,
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(
+            json.contains(r#""status_5xx_count":7"#),
+            "status_5xx_count must always appear in serialized AppStatus; got: {json}"
         );
     }
     // ── deserialize_allowlist rolling-upgrade contract ────────────────────

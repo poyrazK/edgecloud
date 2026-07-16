@@ -1387,7 +1387,7 @@ func TestRollbackDeployment_TenantDisabledMidTx_NoPublish(t *testing.T) {
 	// outbox INSERT, no publish.
 	mock.ExpectRollback()
 
-	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "")
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "", false)
 	if err == nil {
 		t.Fatalf("RollbackDeployment: want ErrTenantDisabled, got nil")
 	}
@@ -1422,7 +1422,7 @@ func TestRollbackDeployment_TenantNotFound_NoPublish(t *testing.T) {
 	expectTenantForUpdateNotFound(mock, tenantID)
 	mock.ExpectRollback()
 
-	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "")
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "", false)
 	if err == nil {
 		t.Fatalf("RollbackDeployment: want ErrTenantNotFound, got nil")
 	}
@@ -1626,7 +1626,7 @@ func TestRollbackDeployment_NormalTenant_Proceeds(t *testing.T) {
 	// so publishSwap short-circuits to a no-op. No SQL after this
 	// commit — the drainer owns the publish on the next tick.
 
-	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "")
+	rolledBackID, err := svc.RollbackDeployment(context.Background(), tenantID, appName, "", false)
 	if err != nil {
 		t.Fatalf("RollbackDeployment: %v", err)
 	}
